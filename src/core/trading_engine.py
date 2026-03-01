@@ -231,7 +231,7 @@ class TradingEngine:
 
         return MarketData(
             market=market,
-            candles=raw_candles,
+            candles=df.to_dict(orient="records"),
             current_price=float(current_price),
             indicators=indicators,
         )
