@@ -6,11 +6,11 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
 
-from data.database import Database
-from data.models import Candle
+from src.data.database import Database
+from src.data.models import Candle
 
 if TYPE_CHECKING:
-    from api.upbit_client import UpbitClient
+    from src.api.upbit_client import UpbitClient
 
 logger = logging.getLogger(__name__)
 

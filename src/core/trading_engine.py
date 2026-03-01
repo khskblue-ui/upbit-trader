@@ -5,15 +5,24 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
+import pandas as pd
 
 from src.data.database import Database
 from src.data.models import Trade
 from src.execution.base import BaseExecutor, OrderRequest
+from src.indicators.technical import compute_indicators
 from src.risk.base import PortfolioState, RiskDecision
 from src.risk.engine import RiskEngine
 from src.strategy.base import BaseStrategy, MarketData, Signal, TradeSignal
 
+if TYPE_CHECKING:
+    from src.api.upbit_client import UpbitClient
+
 logger = logging.getLogger(__name__)
+
+_CANDLE_FETCH_COUNT = 100  # candles to fetch per evaluation cycle
 
 
 class TradingEngine:
@@ -37,12 +46,14 @@ class TradingEngine:
         risk_engine: RiskEngine,
         db: Database | None = None,
         poll_interval: float = 60.0,
+        upbit_client: "UpbitClient | None" = None,
     ) -> None:
         self.strategies = strategies
         self.executor = executor
         self.risk_engine = risk_engine
         self.db = db
         self.poll_interval = poll_interval
+        self._upbit_client = upbit_client
         self._running = False
 
     # ------------------------------------------------------------------
@@ -177,16 +188,53 @@ class TradingEngine:
     async def _fetch_market_data(
         self, strategy: BaseStrategy, market: str
     ) -> MarketData | None:
-        """Fetch and assemble :class:`MarketData` for the given market.
+        """Fetch live candles via UpbitClient and assemble :class:`MarketData`.
 
-        Currently returns a placeholder — real implementation would call
-        the DataCollector / UpbitClient to retrieve live candles.
+        Returns ``None`` when no client is configured (backtest callers skip gracefully).
         """
-        # NOTE: In a real deployment this would call:
-        #   candles = await data_collector.get_candles(market, timeframe, count)
-        #   indicators = compute_indicators(df, strategy.required_indicators())
-        # For now we return None so callers skip gracefully.
-        return None
+        if self._upbit_client is None:
+            return None
+
+        timeframes = strategy.required_timeframes()
+        timeframe = timeframes[0] if timeframes else "1d"
+
+        try:
+            raw_candles = await self._upbit_client.get_candles(
+                market=market,
+                timeframe=timeframe,
+                count=_CANDLE_FETCH_COUNT,
+            )
+        except Exception as exc:
+            logger.error("Failed to fetch candles for %s/%s: %s", market, timeframe, exc)
+            return None
+
+        if not raw_candles:
+            logger.warning("No candles returned for %s/%s", market, timeframe)
+            return None
+
+        # Upbit returns newest-first; reverse to chronological order
+        raw_candles = list(reversed(raw_candles))
+
+        df = pd.DataFrame([
+            {
+                "open": float(c.get("opening_price", 0)),
+                "high": float(c.get("high_price", 0)),
+                "low": float(c.get("low_price", 0)),
+                "close": float(c.get("trade_price", 0)),
+                "volume": float(c.get("candle_acc_trade_volume", 0)),
+            }
+            for c in raw_candles
+        ])
+
+        indicators = compute_indicators(df, strategy.required_indicators())
+        current_price = df["close"].iloc[-1]
+
+        return MarketData(
+            market=market,
+            candles=raw_candles,
+            current_price=float(current_price),
+            indicators=indicators,
+        )
 
     @staticmethod
     def _signal_to_order(signal: TradeSignal) -> OrderRequest:
