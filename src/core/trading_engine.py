@@ -1,0 +1,221 @@
+"""TradingEngine — main orchestration loop connecting data → strategy → risk → execution."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timezone
+
+from src.data.database import Database
+from src.data.models import Trade
+from src.execution.base import BaseExecutor, OrderRequest
+from src.risk.base import PortfolioState, RiskDecision
+from src.risk.engine import RiskEngine
+from src.strategy.base import BaseStrategy, MarketData, Signal, TradeSignal
+
+logger = logging.getLogger(__name__)
+
+
+class TradingEngine:
+    """Orchestrate the full trading loop: data collection → signal → risk → order.
+
+    This class is intentionally a *pure orchestrator*: it holds no trading
+    logic itself, delegating all decisions to injected strategy and risk objects.
+
+    Args:
+        strategies: List of :class:`BaseStrategy` instances to run.
+        executor: :class:`BaseExecutor` for order submission (live or paper).
+        risk_engine: :class:`RiskEngine` that validates signals before execution.
+        db: Optional :class:`Database` for persisting trade records.
+        poll_interval: Seconds between strategy evaluation cycles.
+    """
+
+    def __init__(
+        self,
+        strategies: list[BaseStrategy],
+        executor: BaseExecutor,
+        risk_engine: RiskEngine,
+        db: Database | None = None,
+        poll_interval: float = 60.0,
+    ) -> None:
+        self.strategies = strategies
+        self.executor = executor
+        self.risk_engine = risk_engine
+        self.db = db
+        self.poll_interval = poll_interval
+        self._running = False
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Call ``on_startup`` on all strategies."""
+        logger.info("TradingEngine starting with %d strategies.", len(self.strategies))
+        for strategy in self.strategies:
+            await strategy.on_startup()
+        self._running = True
+
+    async def stop(self) -> None:
+        """Signal the engine to stop and call ``on_shutdown`` on all strategies."""
+        logger.info("TradingEngine stopping.")
+        self._running = False
+        for strategy in self.strategies:
+            await strategy.on_shutdown()
+
+    async def run(self) -> None:
+        """Main event loop — runs until :meth:`stop` is called."""
+        await self.start()
+        try:
+            while self._running:
+                await self._tick()
+                await asyncio.sleep(self.poll_interval)
+        except asyncio.CancelledError:
+            logger.info("TradingEngine cancelled.")
+        finally:
+            await self.stop()
+
+    # ------------------------------------------------------------------
+    # Single evaluation cycle
+    # ------------------------------------------------------------------
+
+    async def _tick(self) -> None:
+        """Run one evaluation cycle across all strategies and their markets."""
+        portfolio = await self._build_portfolio_state()
+
+        for strategy in self.strategies:
+            if not strategy.config.enabled:
+                continue
+            for market in strategy.config.markets:
+                try:
+                    await self._evaluate(strategy, market, portfolio)
+                except Exception as exc:
+                    logger.error(
+                        "Error evaluating %s for %s: %s",
+                        strategy.name, market, exc, exc_info=True,
+                    )
+
+    async def _evaluate(
+        self,
+        strategy: BaseStrategy,
+        market: str,
+        portfolio: PortfolioState,
+    ) -> None:
+        """Evaluate a single strategy/market pair and execute if approved."""
+        market_data = await self._fetch_market_data(strategy, market)
+        if market_data is None:
+            return
+
+        signal: TradeSignal = await strategy.generate_signal(market, market_data)
+        logger.debug("[%s/%s] signal=%s conf=%.2f", strategy.name, market, signal.signal.value, signal.confidence)
+
+        if signal.signal == Signal.HOLD:
+            return
+
+        decision, results = await self.risk_engine.check(signal, portfolio)
+
+        if decision == RiskDecision.REJECT:
+            logger.info(
+                "[%s/%s] Signal REJECTED by risk engine: %s",
+                strategy.name, market, [r.reason for r in results if r.decision == RiskDecision.REJECT],
+            )
+            return
+
+        # APPROVE or MODIFY — execute the (possibly modified) order
+        order = self._signal_to_order(signal)
+        result = await self.executor.execute_order(order)
+
+        if result.success:
+            logger.info(
+                "[%s/%s] %s order executed: qty=%.6f @ %.0f fee=%.2f id=%s",
+                strategy.name, market, order.side,
+                result.quantity, result.price, result.fee, result.order_id,
+            )
+            await strategy.on_trade_executed({
+                "order_id": result.order_id,
+                "market": result.market,
+                "side": result.side,
+                "price": result.price,
+                "quantity": result.quantity,
+                "fee": result.fee,
+                "strategy": strategy.name,
+            })
+            await self._record_trade(strategy.name, result)
+        else:
+            logger.error(
+                "[%s/%s] Order failed: %s",
+                strategy.name, market, result.error,
+            )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    async def _build_portfolio_state(self) -> PortfolioState:
+        """Construct a :class:`PortfolioState` from the executor's current state."""
+        try:
+            available_balance = await self.executor.get_balance("KRW")
+            positions = await self.executor.get_positions()
+            position_value = sum(
+                p.get("current_value", 0) for p in positions.values()
+            )
+            total_balance = available_balance + position_value
+            return PortfolioState(
+                total_balance=total_balance,
+                available_balance=available_balance,
+                positions=positions,
+                peak_balance=total_balance,  # simplified; real impl tracks this
+            )
+        except Exception as exc:
+            logger.error("Failed to build portfolio state: %s", exc)
+            return PortfolioState(
+                total_balance=0.0,
+                available_balance=0.0,
+                positions={},
+            )
+
+    async def _fetch_market_data(
+        self, strategy: BaseStrategy, market: str
+    ) -> MarketData | None:
+        """Fetch and assemble :class:`MarketData` for the given market.
+
+        Currently returns a placeholder — real implementation would call
+        the DataCollector / UpbitClient to retrieve live candles.
+        """
+        # NOTE: In a real deployment this would call:
+        #   candles = await data_collector.get_candles(market, timeframe, count)
+        #   indicators = compute_indicators(df, strategy.required_indicators())
+        # For now we return None so callers skip gracefully.
+        return None
+
+    @staticmethod
+    def _signal_to_order(signal: TradeSignal) -> OrderRequest:
+        """Convert a :class:`TradeSignal` to an :class:`OrderRequest`."""
+        return OrderRequest(
+            market=signal.market,
+            side=signal.signal.value,  # "buy" or "sell"
+            quantity=signal.suggested_size,
+            order_type="market",
+        )
+
+    async def _record_trade(self, strategy_name: str, result) -> None:
+        """Persist a completed trade to the database (no-op if db is None)."""
+        if self.db is None:
+            return
+        try:
+            trade = Trade(
+                market=result.market,
+                side=result.side,
+                strategy=strategy_name,
+                price=result.price,
+                quantity=result.quantity,
+                fee=result.fee,
+                pnl=None,
+                order_id=result.order_id,
+                timestamp=datetime.now(timezone.utc),
+            )
+            async with self.db.get_session() as session:
+                session.add(trade)
+            logger.debug("Trade recorded: %s %s %s", result.market, result.side, result.order_id)
+        except Exception as exc:
+            logger.error("Failed to record trade: %s", exc)
