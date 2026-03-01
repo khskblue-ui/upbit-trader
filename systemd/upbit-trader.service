@@ -1,0 +1,35 @@
+[Unit]
+Description=Upbit Automated Trading System
+Documentation=https://github.com/khskblue-ui/upbit-trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=upbit
+Group=upbit
+
+WorkingDirectory=__PROJECT_DIR__
+EnvironmentFile=__ENV_FILE__
+ExecStart=__VENV_DIR__/bin/python -m src.main
+
+# Restart policy
+Restart=on-failure
+RestartSec=10s
+StartLimitInterval=300s
+StartLimitBurst=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=upbit-trader
+
+# Security hardening
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=__PROJECT_DIR__/logs __PROJECT_DIR__/data
+NoNewPrivileges=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
