@@ -1,0 +1,15 @@
+risk_rules:
+  - name: max_position_size
+    enabled: true
+    max_ratio_per_asset: 0.20
+    max_total_investment: 0.70
+    max_concurrent_positions: 5
+  - name: daily_loss_limit
+    enabled: true
+    max_daily_loss_pct: 0.05
+  - name: mdd_circuit_breaker
+    enabled: true
+    max_drawdown_pct: 0.15
+  - name: consecutive_loss_guard
+    enabled: true
+    max_consecutive_losses: 5

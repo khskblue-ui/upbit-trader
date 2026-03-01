@@ -1,0 +1,22 @@
+strategies:
+  volatility_breakout:
+    enabled: true
+    markets: ["KRW-BTC", "KRW-ETH"]
+    k_value: 0.5
+    sell_time: "00:00"
+  rsi_bollinger:
+    enabled: true
+    markets: ["KRW-BTC"]
+    rsi_period: 14
+    rsi_oversold: 30
+    rsi_overbought: 70
+    bb_period: 20
+    bb_std: 2.0
+    stop_loss_pct: 0.03
+  macd_momentum:
+    enabled: false
+    markets: ["KRW-BTC", "KRW-ETH"]
+    fast_period: 12
+    slow_period: 26
+    signal_period: 9
+    volume_multiplier: 1.5
