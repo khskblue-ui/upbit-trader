@@ -168,6 +168,7 @@ async def run(settings: Settings, mode: str) -> None:
         db=db,
         poll_interval=poll_interval,
         upbit_client=upbit_client,
+        telegram=telegram,
     )
 
     # -- Graceful shutdown --
@@ -181,17 +182,34 @@ async def run(settings: Settings, mode: str) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _shutdown, sig.name)
 
+    # -- Telegram command handler --
+    from src.notification.command_handler import TelegramCommandHandler
+    command_handler = TelegramCommandHandler(
+        notifier=telegram,
+        engine=engine,
+        executor=executor,
+        strategies=strategies,
+        mode=mode,
+        stop_callback=stop_event.set,
+        authorized_chat_id=settings.telegram_chat_id,
+    )
+
     # -- Start --
     await telegram.notify_system_start(mode)
     logger.info("Trading engine starting in '%s' mode.", mode)
+    logger.info("Telegram command handler started. Send /help to @GustjdBot for commands.")
 
-    # engine.run() handles start() and stop() internally
+    # Run engine + command handler concurrently
     try:
         engine_task = asyncio.create_task(engine.run())
+        command_task = asyncio.create_task(command_handler.run())
+
         await stop_event.wait()
+
         engine_task.cancel()
+        command_task.cancel()
         try:
-            await engine_task
+            await asyncio.gather(engine_task, command_task, return_exceptions=True)
         except asyncio.CancelledError:
             pass
     finally:

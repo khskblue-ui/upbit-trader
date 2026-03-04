@@ -154,3 +154,21 @@ class TelegramNotifier:
         if reason:
             text += f"\n사유: {reason}"
         return await self.send(text)
+
+    async def notify_order_failed(
+        self,
+        market: str,
+        side: str,
+        error: str,
+        strategy: str,
+    ) -> bool:
+        """Notify when an order fails to execute."""
+        side_kor = "매수" if side == "buy" else "매도"
+        text = (
+            f"⚠️ <b>[주문 실패]</b>\n"
+            f"마켓: <code>{market}</code>\n"
+            f"방향: <code>{side_kor}</code>\n"
+            f"전략: <code>{strategy}</code>\n"
+            f"사유: <code>{error}</code>"
+        )
+        return await self.send(text)

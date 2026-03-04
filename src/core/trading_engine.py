@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from typing import TYPE_CHECKING
 
 import pandas as pd
@@ -19,10 +19,12 @@ from src.strategy.base import BaseStrategy, MarketData, Signal, TradeSignal
 
 if TYPE_CHECKING:
     from src.api.upbit_client import UpbitClient
+    from src.notification.telegram_bot import TelegramNotifier
 
 logger = logging.getLogger(__name__)
 
 _CANDLE_FETCH_COUNT = 100  # candles to fetch per evaluation cycle
+KST = timezone(timedelta(hours=9))
 
 
 class TradingEngine:
@@ -37,6 +39,7 @@ class TradingEngine:
         risk_engine: :class:`RiskEngine` that validates signals before execution.
         db: Optional :class:`Database` for persisting trade records.
         poll_interval: Seconds between strategy evaluation cycles.
+        telegram: Optional :class:`TelegramNotifier` for trade/error alerts.
     """
 
     def __init__(
@@ -47,6 +50,7 @@ class TradingEngine:
         db: Database | None = None,
         poll_interval: float = 60.0,
         upbit_client: "UpbitClient | None" = None,
+        telegram: "TelegramNotifier | None" = None,
     ) -> None:
         self.strategies = strategies
         self.executor = executor
@@ -54,7 +58,12 @@ class TradingEngine:
         self.db = db
         self.poll_interval = poll_interval
         self._upbit_client = upbit_client
+        self._telegram = telegram
         self._running = False
+        self._paused = False  # Set True via command handler to pause without stopping
+
+        # Track buy date per market for next-session sell logic (KST date)
+        self._buy_dates: dict[str, date] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -92,6 +101,10 @@ class TradingEngine:
 
     async def _tick(self) -> None:
         """Run one evaluation cycle across all strategies and their markets."""
+        if self._paused:
+            logger.debug("TradingEngine paused — skipping tick.")
+            return
+
         portfolio = await self._build_portfolio_state()
 
         for strategy in self.strategies:
@@ -112,13 +125,40 @@ class TradingEngine:
         market: str,
         portfolio: PortfolioState,
     ) -> None:
-        """Evaluate a single strategy/market pair and execute if approved."""
+        """Evaluate a single strategy/market pair and execute if approved.
+
+        Sell logic (volatility breakout next-session sell):
+          If we hold a position from a previous KST day, sell immediately at
+          current price (simulates selling at next session's open).
+
+        Buy logic:
+          Ask the strategy for a signal; run through risk engine; execute order.
+          Price is passed explicitly so paper/backtest fills are realistic.
+        """
         market_data = await self._fetch_market_data(strategy, market)
         if market_data is None:
             return
 
+        # ------------------------------------------------------------------
+        # Sell check: if we hold a position from a PREVIOUS trading session
+        # ------------------------------------------------------------------
+        pos = portfolio.positions.get(market, {})
+        position_qty = float(pos.get("quantity", 0)) if pos else 0.0
+
+        if position_qty > 0 and market in self._buy_dates:
+            today_kst = datetime.now(KST).date()
+            if today_kst > self._buy_dates[market]:
+                await self._execute_next_session_sell(strategy, market, portfolio, position_qty, market_data)
+                return  # Done for this market this tick
+
+        # ------------------------------------------------------------------
+        # Buy check: ask strategy for signal, validate risk, execute
+        # ------------------------------------------------------------------
         signal: TradeSignal = await strategy.generate_signal(market, market_data)
-        logger.debug("[%s/%s] signal=%s conf=%.2f", strategy.name, market, signal.signal.value, signal.confidence)
+        logger.debug(
+            "[%s/%s] signal=%s conf=%.2f",
+            strategy.name, market, signal.signal.value, signal.confidence,
+        )
 
         if signal.signal == Signal.HOLD:
             return
@@ -128,12 +168,19 @@ class TradingEngine:
         if decision == RiskDecision.REJECT:
             logger.info(
                 "[%s/%s] Signal REJECTED by risk engine: %s",
-                strategy.name, market, [r.reason for r in results if r.decision == RiskDecision.REJECT],
+                strategy.name, market,
+                [r.reason for r in results if r.decision == RiskDecision.REJECT],
             )
             return
 
         # APPROVE or MODIFY — execute the (possibly modified) order
-        order = self._signal_to_order(signal)
+        order = OrderRequest(
+            market=signal.market,
+            side=signal.signal.value,    # "buy" or "sell"
+            quantity=signal.suggested_size,
+            order_type="market",
+            price=market_data.current_price,  # critical: realistic paper fills
+        )
         result = await self.executor.execute_order(order)
 
         if result.success:
@@ -142,6 +189,19 @@ class TradingEngine:
                 strategy.name, market, order.side,
                 result.quantity, result.price, result.fee, result.order_id,
             )
+
+            # Track buy date for next-session sell
+            if signal.signal == Signal.BUY:
+                self._buy_dates[market] = datetime.now(KST).date()
+                if self._telegram:
+                    await self._telegram.notify_buy(
+                        market=market,
+                        price=result.price,
+                        quantity=result.quantity,
+                        strategy=strategy.name,
+                        confidence=signal.confidence,
+                    )
+
             await strategy.on_trade_executed({
                 "order_id": result.order_id,
                 "market": result.market,
@@ -152,11 +212,85 @@ class TradingEngine:
                 "strategy": strategy.name,
             })
             await self._record_trade(strategy.name, result)
+
         else:
             logger.error(
                 "[%s/%s] Order failed: %s",
                 strategy.name, market, result.error,
             )
+            if self._telegram:
+                await self._telegram.notify_order_failed(
+                    market=market,
+                    side=order.side,
+                    error=result.error or "Unknown error",
+                    strategy=strategy.name,
+                )
+
+    # ------------------------------------------------------------------
+    # Next-session sell
+    # ------------------------------------------------------------------
+
+    async def _execute_next_session_sell(
+        self,
+        strategy: BaseStrategy,
+        market: str,
+        portfolio: PortfolioState,
+        quantity: float,
+        market_data: MarketData,
+    ) -> None:
+        """Sell an entire position at the next session's open price (current price)."""
+        sell_order = OrderRequest(
+            market=market,
+            side="sell",
+            quantity=quantity,
+            order_type="market",
+            price=market_data.current_price,
+        )
+        result = await self.executor.execute_order(sell_order)
+
+        if result.success:
+            pos = portfolio.positions.get(market, {})
+            avg_price = float(pos.get("avg_price", result.price))
+            pnl = (result.price - avg_price) * result.quantity - result.fee
+
+            logger.info(
+                "[%s] Next-session SELL executed: qty=%.6f @ %.0f pnl=%.2f id=%s",
+                market, result.quantity, result.price, pnl, result.order_id,
+            )
+
+            if self._telegram:
+                await self._telegram.notify_sell(
+                    market=market,
+                    price=result.price,
+                    quantity=result.quantity,
+                    pnl=pnl,
+                    strategy=strategy.name,
+                )
+
+            # Clear buy date so we can re-enter on next signal
+            self._buy_dates.pop(market, None)
+
+            await strategy.on_trade_executed({
+                "order_id": result.order_id,
+                "market": result.market,
+                "side": result.side,
+                "price": result.price,
+                "quantity": result.quantity,
+                "fee": result.fee,
+                "strategy": strategy.name,
+                "pnl": pnl,
+            })
+            await self._record_trade(strategy.name, result)
+
+        else:
+            logger.error("[%s] Next-session SELL failed: %s", market, result.error)
+            if self._telegram:
+                await self._telegram.notify_order_failed(
+                    market=market,
+                    side="sell",
+                    error=result.error or "Unknown error",
+                    strategy=strategy.name,
+                )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -217,6 +351,7 @@ class TradingEngine:
 
         df = pd.DataFrame([
             {
+                "date": c.get("candle_date_time_kst", "")[:10],
                 "open": float(c.get("opening_price", 0)),
                 "high": float(c.get("high_price", 0)),
                 "low": float(c.get("low_price", 0)),
@@ -237,13 +372,14 @@ class TradingEngine:
         )
 
     @staticmethod
-    def _signal_to_order(signal: TradeSignal) -> OrderRequest:
+    def _signal_to_order(signal: TradeSignal, current_price: float = 0.0) -> OrderRequest:
         """Convert a :class:`TradeSignal` to an :class:`OrderRequest`."""
         return OrderRequest(
             market=signal.market,
             side=signal.signal.value,  # "buy" or "sell"
             quantity=signal.suggested_size,
             order_type="market",
+            price=current_price,
         )
 
     async def _record_trade(self, strategy_name: str, result) -> None:
