@@ -8,6 +8,7 @@ Supported commands:
     /disable <name>    — Disable a strategy by name
     /set <name> <param> <value>  — Change a strategy parameter
     /k <val>           — Change k_value (0.1–0.9) for all applicable strategies
+    /mode <paper|live> — Switch trading mode (paper = virtual, live = real money)
     /pause             — Pause trading (no new orders)
     /resume            — Resume trading
     /stop              — Gracefully stop the trading engine
@@ -152,6 +153,7 @@ class TelegramCommandHandler:
             "/disable":  self._cmd_disable,
             "/set":      self._cmd_set,
             "/k":        self._cmd_k,
+            "/mode":     self._cmd_mode,
             "/pause":    self._cmd_pause,
             "/resume":   self._cmd_resume,
             "/stop":     self._cmd_stop,
@@ -376,6 +378,41 @@ class TelegramCommandHandler:
         else:
             await self._notifier.send("⚠️ K값을 사용하는 전략이 없습니다.")
 
+    async def _cmd_mode(self, args: list[str]) -> None:
+        """Switch between paper (virtual) and live (real money) trading mode."""
+        current_mode = self._engine._mode
+        if not args:
+            current_kor = "실거래" if current_mode == "live" else "모의투자"
+            has_live = self._engine._live_executor is not None
+            live_avail = "✅ 사용 가능" if has_live else "❌ API 키 미설정"
+            await self._notifier.send(
+                f"📡 <b>[현재 모드]</b> <code>{current_kor}</code>\n\n"
+                f"모드 전환:\n"
+                f"  /mode live  — 실거래 ({live_avail})\n"
+                f"  /mode paper — 모의투자 (항상 가능)\n\n"
+                f"⚠️ live 모드는 실제 자금으로 거래됩니다."
+            )
+            return
+
+        new_mode = args[0].lower()
+        if new_mode not in ("paper", "live"):
+            await self._notifier.send(
+                "⚠️ 잘못된 모드입니다.\n"
+                "사용법: /mode paper 또는 /mode live"
+            )
+            return
+
+        try:
+            old_mode = self._engine._mode
+            self._engine.switch_mode(new_mode)
+            # Update command handler's own executor reference for /status queries
+            self._executor = self._engine.executor
+            self._mode = new_mode
+            logger.info("Mode switched via Telegram: %s → %s", old_mode, new_mode)
+            await self._notifier.notify_mode_changed(old_mode, new_mode)
+        except ValueError as exc:
+            await self._notifier.send(f"⚠️ 모드 전환 실패: <code>{exc}</code>")
+
     async def _cmd_pause(self, args: list[str]) -> None:
         """Pause order execution without stopping the engine."""
         self._engine._paused = True
@@ -413,6 +450,7 @@ class TelegramCommandHandler:
             "  예: /set trend_filtered_breakout rsi_min 40\n"
             "/k &lt;값&gt; — K값 일괄 변경 (범위 0.1~0.9)\n\n"
             "<b>🎮 운영 제어</b>\n"
+            "/mode &lt;paper|live&gt; — 모드 전환 (모의투자 ↔ 실거래)\n"
             "/pause — 거래 일시정지 (모니터링 계속)\n"
             "/resume — 거래 재개\n"
             "/stop — 봇 종료\n"

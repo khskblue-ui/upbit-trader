@@ -148,16 +148,20 @@ async def run(settings: Settings, mode: str) -> None:
     risk_engine = RiskEngine(risk_rules)
     logger.info("RiskEngine initialised with %d rules.", len(risk_rules))
 
-    # -- Executor --
-    if mode == "live":
+    # -- Executors (always create paper; create live only if API keys present) --
+    from src.execution.backtest_executor import BacktestExecutor
+    initial_capital = 1_000_000.0  # 100만원 가상 자본
+    paper_executor = BacktestExecutor(initial_capital=initial_capital)
+    logger.info("BacktestExecutor: initial_capital=%.0f KRW", initial_capital)
+
+    live_executor = None
+    if upbit_client is not None:
         from src.execution.live_executor import LiveExecutor
-        executor = LiveExecutor(upbit_client)
-    else:
-        # backtest and paper both use the virtual executor
-        from src.execution.backtest_executor import BacktestExecutor
-        initial_capital = 1_000_000.0  # 100만원 가상 자본
-        executor = BacktestExecutor(initial_capital=initial_capital)
-        logger.info("BacktestExecutor: initial_capital=%.0f KRW", initial_capital)
+        live_executor = LiveExecutor(upbit_client)
+        logger.info("LiveExecutor ready (mode=%s)", mode)
+
+    # Active executor depends on current mode
+    executor = live_executor if mode == "live" else paper_executor
 
     # -- Trading engine --
     from src.core.trading_engine import TradingEngine
@@ -170,6 +174,9 @@ async def run(settings: Settings, mode: str) -> None:
         poll_interval=poll_interval,
         upbit_client=upbit_client,
         telegram=telegram,
+        mode=mode,
+        live_executor=live_executor,
+        paper_executor=paper_executor,
     )
 
     # -- Graceful shutdown --

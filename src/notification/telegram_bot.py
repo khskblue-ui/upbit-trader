@@ -250,3 +250,22 @@ class TelegramNotifier:
         if detail:
             text += f"\n상세: {detail}"
         return await self.send(text)
+
+    async def notify_mode_changed(
+        self,
+        old_mode: str,
+        new_mode: str,
+    ) -> bool:
+        """Notify when trading mode is switched (paper ↔ live)."""
+        icon = "🔴" if new_mode == "live" else "📄"
+        mode_kor = {"live": "실거래", "paper": "모의투자"}.get(new_mode, new_mode)
+        old_kor = {"live": "실거래", "paper": "모의투자"}.get(old_mode, old_mode)
+        text = (
+            f"{icon} <b>[모드 전환]</b>\n"
+            f"<code>{old_kor}</code> → <code>{mode_kor}</code>\n"
+        )
+        if new_mode == "live":
+            text += "⚠️ <b>실제 자금으로 거래합니다.</b>"
+        else:
+            text += "📄 가상 자금으로 거래합니다."
+        return await self.send(text)

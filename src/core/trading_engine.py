@@ -51,6 +51,9 @@ class TradingEngine:
         poll_interval: float = 60.0,
         upbit_client: "UpbitClient | None" = None,
         telegram: "TelegramNotifier | None" = None,
+        mode: str = "paper",
+        live_executor: BaseExecutor | None = None,
+        paper_executor: BaseExecutor | None = None,
     ) -> None:
         self.strategies = strategies
         self.executor = executor
@@ -61,9 +64,43 @@ class TradingEngine:
         self._telegram = telegram
         self._running = False
         self._paused = False  # Set True via command handler to pause without stopping
+        self._mode = mode
+
+        # Executor references for mode switching
+        self._live_executor: BaseExecutor | None = live_executor or (executor if mode == "live" else None)
+        self._paper_executor: BaseExecutor | None = paper_executor or (executor if mode in ("paper", "backtest") else None)
 
         # Track buy date per market for next-session sell logic (KST date)
         self._buy_dates: dict[str, date] = {}
+
+    # ------------------------------------------------------------------
+    # Mode switching
+    # ------------------------------------------------------------------
+
+    def switch_mode(self, new_mode: str) -> None:
+        """Switch between paper and live trading mode at runtime.
+
+        Args:
+            new_mode: ``"paper"`` or ``"live"``
+
+        Raises:
+            ValueError: When the target executor is not available.
+        """
+        if new_mode not in ("paper", "live"):
+            raise ValueError(f"Invalid mode '{new_mode}': must be 'paper' or 'live'")
+        if new_mode == self._mode:
+            raise ValueError(f"Already in '{new_mode}' mode")
+        if new_mode == "live" and self._live_executor is None:
+            raise ValueError(
+                "Live mode unavailable: UPBIT_ACCESS_KEY / UPBIT_SECRET_KEY not configured"
+            )
+        if new_mode == "paper" and self._paper_executor is None:
+            raise ValueError("Paper executor not available")
+
+        old_mode = self._mode
+        self.executor = self._live_executor if new_mode == "live" else self._paper_executor
+        self._mode = new_mode
+        logger.info("Trading mode switched: %s → %s", old_mode, new_mode)
 
     # ------------------------------------------------------------------
     # Lifecycle
