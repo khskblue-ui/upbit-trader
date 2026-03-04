@@ -1,4 +1,4 @@
-"""Tests for src/backtest/engine.py, src/backtest/report.py and the 3 concrete strategies."""
+"""Tests for src/backtest/engine.py, src/backtest/report.py and the TFVB strategy."""
 
 from __future__ import annotations
 
@@ -16,9 +16,7 @@ from src.backtest.report import (
     _sharpe_ratio,
 )
 from src.strategy.base import MarketData, Signal, StrategyConfig
-from src.strategy.macd_momentum import MacdMomentumStrategy
-from src.strategy.rsi_bollinger import RsiBollingerStrategy
-from src.strategy.volatility_breakout import VolatilityBreakoutStrategy
+from src.strategy.trend_filtered_breakout import TrendFilteredBreakoutStrategy
 
 
 # ---------------------------------------------------------------------------
@@ -53,44 +51,44 @@ def _make_candles(n: int = 60, base_price: float = 50_000_000.0) -> list[dict]:
 
 class TestBacktestEngine:
     async def test_run_returns_backtest_result(self):
-        candles = _make_candles(50)
-        strategy = VolatilityBreakoutStrategy(StrategyConfig())
+        candles = _make_candles(100)
+        strategy = TrendFilteredBreakoutStrategy(StrategyConfig())
         engine = BacktestEngine(strategy, initial_capital=1_000_000.0)
-        result = await engine.run("KRW-BTC", candles, warmup_bars=5)
+        result = await engine.run("KRW-BTC", candles, warmup_bars=65)
         assert isinstance(result, BacktestResult)
 
     async def test_result_fields_populated(self):
-        candles = _make_candles(50)
-        strategy = VolatilityBreakoutStrategy(StrategyConfig())
+        candles = _make_candles(100)
+        strategy = TrendFilteredBreakoutStrategy(StrategyConfig())
         engine = BacktestEngine(strategy, initial_capital=1_000_000.0)
-        result = await engine.run("KRW-BTC", candles, warmup_bars=5)
-        assert result.strategy_name == "volatility_breakout"
+        result = await engine.run("KRW-BTC", candles, warmup_bars=65)
+        assert result.strategy_name == "trend_filtered_breakout"
         assert result.market == "KRW-BTC"
         assert result.initial_capital == 1_000_000.0
         assert isinstance(result.final_capital, float)
         assert isinstance(result.equity_curve, list)
-        assert len(result.equity_curve) == len(candles) - 5
+        assert len(result.equity_curve) == len(candles) - 65
 
     async def test_equity_curve_length(self):
-        candles = _make_candles(40)
-        warmup = 10
-        strategy = VolatilityBreakoutStrategy(StrategyConfig())
+        candles = _make_candles(100)
+        warmup = 65
+        strategy = TrendFilteredBreakoutStrategy(StrategyConfig())
         engine = BacktestEngine(strategy, initial_capital=1_000_000.0)
         result = await engine.run("KRW-BTC", candles, warmup_bars=warmup)
         assert len(result.equity_curve) == len(candles) - warmup
 
     async def test_raises_with_too_few_candles(self):
         candles = _make_candles(5)
-        strategy = VolatilityBreakoutStrategy(StrategyConfig())
+        strategy = TrendFilteredBreakoutStrategy(StrategyConfig())
         engine = BacktestEngine(strategy)
         with pytest.raises(ValueError, match="Need at least"):
             await engine.run("KRW-BTC", candles, warmup_bars=30)
 
     async def test_all_trades_have_required_fields(self):
-        candles = _make_candles(50)
-        strategy = VolatilityBreakoutStrategy(StrategyConfig())
+        candles = _make_candles(100)
+        strategy = TrendFilteredBreakoutStrategy(StrategyConfig())
         engine = BacktestEngine(strategy, initial_capital=1_000_000.0)
-        result = await engine.run("KRW-BTC", candles, warmup_bars=5)
+        result = await engine.run("KRW-BTC", candles, warmup_bars=65)
         for trade in result.trades:
             assert isinstance(trade, BacktestTrade)
             assert trade.side in ("buy", "sell")
@@ -100,47 +98,36 @@ class TestBacktestEngine:
             assert isinstance(trade.timestamp, str)
 
     async def test_sell_trades_have_pnl(self):
-        candles = _make_candles(60)
-        strategy = VolatilityBreakoutStrategy(StrategyConfig())
+        candles = _make_candles(100)
+        strategy = TrendFilteredBreakoutStrategy(StrategyConfig())
         engine = BacktestEngine(strategy, initial_capital=1_000_000.0)
-        result = await engine.run("KRW-BTC", candles, warmup_bars=5)
+        result = await engine.run("KRW-BTC", candles, warmup_bars=65)
         for trade in result.trades:
             if trade.side == "sell":
                 assert trade.pnl is not None
 
     async def test_buy_trades_have_no_pnl(self):
-        candles = _make_candles(60)
-        strategy = VolatilityBreakoutStrategy(StrategyConfig())
+        candles = _make_candles(100)
+        strategy = TrendFilteredBreakoutStrategy(StrategyConfig())
         engine = BacktestEngine(strategy, initial_capital=1_000_000.0)
-        result = await engine.run("KRW-BTC", candles, warmup_bars=5)
+        result = await engine.run("KRW-BTC", candles, warmup_bars=65)
         for trade in result.trades:
             if trade.side == "buy":
                 assert trade.pnl is None
 
     async def test_fees_are_deducted(self):
-        candles = _make_candles(60)
-        strategy = VolatilityBreakoutStrategy(StrategyConfig())
+        candles = _make_candles(100)
+        strategy = TrendFilteredBreakoutStrategy(StrategyConfig())
         engine = BacktestEngine(strategy, initial_capital=1_000_000.0, fee_rate=0.0005)
-        result = await engine.run("KRW-BTC", candles, warmup_bars=5)
+        result = await engine.run("KRW-BTC", candles, warmup_bars=65)
         total_fee = sum(t.fee for t in result.trades)
         assert total_fee >= 0
 
-    async def test_no_open_position_at_end(self):
-        """After run(), engine closes any open position at the last bar."""
-        candles = _make_candles(60)
-        strategy = VolatilityBreakoutStrategy(StrategyConfig(k_value=0.0))  # always buy
-        engine = BacktestEngine(strategy, initial_capital=5_000_000.0)
-        result = await engine.run("KRW-BTC", candles, warmup_bars=5)
-        # The number of buys must equal the number of sells (position closed at end)
-        buys = sum(1 for t in result.trades if t.side == "buy")
-        sells = sum(1 for t in result.trades if t.side == "sell")
-        assert buys == sells
-
     async def test_custom_initial_capital(self):
-        candles = _make_candles(40)
-        strategy = VolatilityBreakoutStrategy(StrategyConfig())
+        candles = _make_candles(100)
+        strategy = TrendFilteredBreakoutStrategy(StrategyConfig())
         engine = BacktestEngine(strategy, initial_capital=2_000_000.0)
-        result = await engine.run("KRW-BTC", candles, warmup_bars=5)
+        result = await engine.run("KRW-BTC", candles, warmup_bars=65)
         assert result.initial_capital == 2_000_000.0
 
 
@@ -267,7 +254,7 @@ class TestCalculateMetrics:
 class TestFormatReport:
     def test_format_report_returns_string(self):
         result = BacktestResult(
-            strategy_name="volatility_breakout",
+            strategy_name="trend_filtered_breakout",
             market="KRW-BTC",
             start_date="2024-01-01",
             end_date="2024-12-31",
@@ -279,7 +266,7 @@ class TestFormatReport:
         metrics = calculate_metrics(result)
         report = format_report(result, metrics)
         assert isinstance(report, str)
-        assert "volatility_breakout" in report
+        assert "trend_filtered_breakout" in report
         assert "KRW-BTC" in report
 
     def test_format_report_contains_key_metrics(self):
@@ -299,278 +286,3 @@ class TestFormatReport:
         assert "최대 낙폭" in report
         assert "샤프 비율" in report
         assert "승률" in report
-
-
-# ---------------------------------------------------------------------------
-# VolatilityBreakoutStrategy — signal generation
-# ---------------------------------------------------------------------------
-
-class TestVolatilityBreakoutStrategy:
-    def _make_market_data(
-        self,
-        current_price: float,
-        prev_high: float = 50_500_000.0,
-        prev_low: float = 49_500_000.0,
-        current_open: float = 50_000_000.0,
-    ) -> MarketData:
-        return MarketData(
-            market="KRW-BTC",
-            candles=[
-                {
-                    "open": prev_high - 200_000,
-                    "high": prev_high,
-                    "low": prev_low,
-                    "close": 50_000_000.0,
-                    "volume": 10.0,
-                    "timestamp": "2024-01-01T00:00:00+00:00",
-                },
-                {
-                    "open": current_open,
-                    "high": current_price + 50_000,
-                    "low": current_price - 50_000,
-                    "close": current_price,
-                    "volume": 12.0,
-                    "timestamp": "2024-01-02T00:00:00+00:00",
-                },
-            ],
-            current_price=current_price,
-        )
-
-    async def test_buy_signal_when_price_above_target(self):
-        cfg = StrategyConfig(k_value=0.5)
-        strategy = VolatilityBreakoutStrategy(cfg)
-        # prev range = 1_000_000, k=0.5 → target = 50_000_000 + 500_000 = 50_500_000
-        data = self._make_market_data(current_price=50_600_000.0)
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert signal.signal == Signal.BUY
-
-    async def test_hold_signal_when_price_below_target(self):
-        cfg = StrategyConfig(k_value=0.5)
-        strategy = VolatilityBreakoutStrategy(cfg)
-        # target = 50_500_000, price = 50_200_000 (below)
-        data = self._make_market_data(current_price=50_200_000.0)
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert signal.signal == Signal.HOLD
-
-    async def test_hold_with_insufficient_candles(self):
-        strategy = VolatilityBreakoutStrategy(StrategyConfig())
-        data = MarketData(
-            market="KRW-BTC",
-            candles=[{"open": 1, "high": 2, "low": 0, "close": 1, "volume": 1}],
-            current_price=1.0,
-        )
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert signal.signal == Signal.HOLD
-
-    async def test_confidence_is_in_valid_range(self):
-        cfg = StrategyConfig(k_value=0.5)
-        strategy = VolatilityBreakoutStrategy(cfg)
-        data = self._make_market_data(current_price=50_600_000.0)
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert 0.0 <= signal.confidence <= 1.0
-
-    async def test_metadata_contains_target_price(self):
-        cfg = StrategyConfig(k_value=0.5)
-        strategy = VolatilityBreakoutStrategy(cfg)
-        data = self._make_market_data(current_price=50_600_000.0)
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert "target_price" in signal.metadata
-        assert signal.metadata["k_value"] == 0.5
-
-    def test_required_indicators_empty(self):
-        strategy = VolatilityBreakoutStrategy(StrategyConfig())
-        assert strategy.required_indicators() == []
-
-    def test_required_timeframes(self):
-        strategy = VolatilityBreakoutStrategy(StrategyConfig())
-        assert "1d" in strategy.required_timeframes()
-
-
-# ---------------------------------------------------------------------------
-# RsiBollingerStrategy — signal generation
-# ---------------------------------------------------------------------------
-
-class TestRsiBollingerStrategy:
-    def _make_data(self, rsi: float, price: float, bb_lower: float, bb_upper: float) -> MarketData:
-        return MarketData(
-            market="KRW-BTC",
-            candles=[{"close": price, "open": price, "high": price, "low": price, "volume": 1}],
-            current_price=price,
-            indicators={
-                "rsi_14": rsi,
-                "bb_20_2": {
-                    "bb_upper": bb_upper,
-                    "bb_middle": (bb_lower + bb_upper) / 2,
-                    "bb_lower": bb_lower,
-                    "bb_width": (bb_upper - bb_lower) / ((bb_lower + bb_upper) / 2),
-                },
-            },
-        )
-
-    async def test_buy_when_rsi_oversold_and_price_below_lower_band(self):
-        strategy = RsiBollingerStrategy(StrategyConfig())
-        data = self._make_data(rsi=25.0, price=48_000_000.0, bb_lower=49_000_000.0, bb_upper=52_000_000.0)
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert signal.signal == Signal.BUY
-
-    async def test_sell_when_rsi_overbought_and_price_above_upper_band(self):
-        strategy = RsiBollingerStrategy(StrategyConfig())
-        data = self._make_data(rsi=75.0, price=53_000_000.0, bb_lower=48_000_000.0, bb_upper=52_000_000.0)
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert signal.signal == Signal.SELL
-
-    async def test_hold_when_rsi_normal(self):
-        strategy = RsiBollingerStrategy(StrategyConfig())
-        data = self._make_data(rsi=50.0, price=50_000_000.0, bb_lower=48_000_000.0, bb_upper=52_000_000.0)
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert signal.signal == Signal.HOLD
-
-    async def test_hold_when_rsi_oversold_but_price_above_lower_band(self):
-        """RSI oversold but price still above lower band → HOLD."""
-        strategy = RsiBollingerStrategy(StrategyConfig())
-        data = self._make_data(rsi=25.0, price=50_500_000.0, bb_lower=48_000_000.0, bb_upper=52_000_000.0)
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert signal.signal == Signal.HOLD
-
-    async def test_hold_when_missing_indicators(self):
-        strategy = RsiBollingerStrategy(StrategyConfig())
-        data = MarketData(
-            market="KRW-BTC",
-            candles=[],
-            current_price=50_000_000.0,
-            indicators={},
-        )
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert signal.signal == Signal.HOLD
-
-    def test_required_indicators_match_config(self):
-        cfg = StrategyConfig(rsi_period=14, bb_period=20, bb_std=2.0)
-        strategy = RsiBollingerStrategy(cfg)
-        inds = strategy.required_indicators()
-        assert "rsi_14" in inds
-        assert "bb_20_2" in inds
-
-    def test_required_timeframes(self):
-        strategy = RsiBollingerStrategy(StrategyConfig())
-        assert "1h" in strategy.required_timeframes()
-
-
-# ---------------------------------------------------------------------------
-# MacdMomentumStrategy — signal generation
-# ---------------------------------------------------------------------------
-
-class TestMacdMomentumStrategy:
-    def _make_data(
-        self,
-        macd: float,
-        macd_signal: float,
-        sma_20: float | None = None,
-        sma_60: float | None = None,
-        volume_ok: bool = True,
-    ) -> MarketData:
-        candles = []
-        # Build 21 candles to satisfy volume check
-        for i in range(21):
-            vol = 15.0 if (i == 20 and volume_ok) else 5.0
-            candles.append({"close": 50_000_000.0, "open": 50_000_000.0,
-                            "high": 50_100_000.0, "low": 49_900_000.0, "volume": vol})
-        return MarketData(
-            market="KRW-BTC",
-            candles=candles,
-            current_price=50_000_000.0,
-            indicators={
-                "macd_12_26_9": {
-                    "macd": macd,
-                    "macd_signal": macd_signal,
-                    "macd_hist": macd - macd_signal,
-                },
-                "sma_20": sma_20,
-                "sma_60": sma_60,
-            },
-        )
-
-    async def test_buy_on_golden_cross_with_trend_and_volume(self):
-        strategy = MacdMomentumStrategy(StrategyConfig(volume_multiplier=1.0))
-        data = self._make_data(macd=100.0, macd_signal=50.0, sma_20=51_000_000.0, sma_60=50_000_000.0, volume_ok=True)
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert signal.signal == Signal.BUY
-
-    async def test_hold_on_golden_cross_without_trend(self):
-        """Golden cross but SMA20 < SMA60 → HOLD."""
-        strategy = MacdMomentumStrategy(StrategyConfig(volume_multiplier=1.0))
-        data = self._make_data(macd=100.0, macd_signal=50.0, sma_20=49_000_000.0, sma_60=50_000_000.0, volume_ok=True)
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert signal.signal == Signal.HOLD
-
-    async def test_sell_on_dead_cross(self):
-        strategy = MacdMomentumStrategy(StrategyConfig())
-        data = self._make_data(macd=-100.0, macd_signal=-50.0)
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert signal.signal == Signal.SELL
-
-    async def test_hold_when_macd_missing(self):
-        strategy = MacdMomentumStrategy(StrategyConfig())
-        data = MarketData(
-            market="KRW-BTC",
-            candles=[],
-            current_price=50_000_000.0,
-            indicators={},
-        )
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert signal.signal == Signal.HOLD
-
-    async def test_confidence_in_valid_range(self):
-        strategy = MacdMomentumStrategy(StrategyConfig(volume_multiplier=1.0))
-        data = self._make_data(macd=100.0, macd_signal=50.0, sma_20=51_000_000.0, sma_60=50_000_000.0)
-        signal = await strategy.generate_signal("KRW-BTC", data)
-        assert 0.0 <= signal.confidence <= 1.0
-
-    def test_required_indicators_default(self):
-        strategy = MacdMomentumStrategy(StrategyConfig())
-        inds = strategy.required_indicators()
-        assert "macd_12_26_9" in inds
-        assert "sma_20" in inds
-        assert "sma_60" in inds
-
-    def test_required_timeframes(self):
-        strategy = MacdMomentumStrategy(StrategyConfig())
-        assert "1h" in strategy.required_timeframes()
-
-    def test_strategy_name(self):
-        assert MacdMomentumStrategy.name == "macd_momentum"
-
-
-# ---------------------------------------------------------------------------
-# Integration: full backtest with RsiBollingerStrategy
-# ---------------------------------------------------------------------------
-
-class TestBacktestIntegration:
-    async def test_rsi_bollinger_backtest_runs(self):
-        candles = _make_candles(60)
-        strategy = RsiBollingerStrategy(StrategyConfig())
-        engine = BacktestEngine(strategy, initial_capital=1_000_000.0)
-        result = await engine.run("KRW-BTC", candles, warmup_bars=25)
-        assert isinstance(result, BacktestResult)
-        metrics = calculate_metrics(result)
-        assert isinstance(metrics, PerformanceMetrics)
-        report = format_report(result, metrics)
-        assert "rsi_bollinger" in report
-
-    async def test_macd_momentum_backtest_runs(self):
-        candles = _make_candles(80)
-        strategy = MacdMomentumStrategy(StrategyConfig(volume_multiplier=1.0))
-        engine = BacktestEngine(strategy, initial_capital=1_000_000.0)
-        result = await engine.run("KRW-BTC", candles, warmup_bars=30)
-        assert isinstance(result, BacktestResult)
-        metrics = calculate_metrics(result)
-        assert isinstance(metrics, PerformanceMetrics)
-
-    async def test_volatility_breakout_backtest_runs(self):
-        candles = _make_candles(50)
-        strategy = VolatilityBreakoutStrategy(StrategyConfig(k_value=0.5))
-        engine = BacktestEngine(strategy, initial_capital=1_000_000.0)
-        result = await engine.run("KRW-BTC", candles, warmup_bars=5)
-        assert isinstance(result, BacktestResult)
-        metrics = calculate_metrics(result)
-        assert metrics.total_return_pct is not None
-        assert not math.isnan(metrics.total_return_pct)

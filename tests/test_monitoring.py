@@ -41,7 +41,7 @@ class TestDailyReport:
             total_pnl=12345.0,
             total_fee=50.0,
             win_rate_pct=60.0,
-            strategies=["rsi_bollinger"],
+            strategies=["trend_filtered_breakout"],
         )
         assert report.date == "2024-06-15"
         assert report.total_trades == 10
@@ -51,7 +51,7 @@ class TestDailyReport:
         assert report.total_pnl == pytest.approx(12345.0)
         assert report.total_fee == pytest.approx(50.0)
         assert report.win_rate_pct == pytest.approx(60.0)
-        assert report.strategies == ["rsi_bollinger"]
+        assert report.strategies == ["trend_filtered_breakout"]
 
 
 class TestWeeklyReport:
@@ -103,7 +103,7 @@ class TestFormatDaily:
             total_pnl=50_000.0,
             total_fee=25.0,
             win_rate_pct=75.0,
-            strategies=["volatility_breakout"],
+            strategies=["trend_filtered_breakout"],
         )
         defaults.update(kwargs)
         return DailyReport(**defaults)
@@ -124,9 +124,9 @@ class TestFormatDaily:
         assert "75.0" in text
 
     def test_contains_strategy_name(self):
-        report = self._make_report(strategies=["macd_momentum"])
+        report = self._make_report(strategies=["trend_filtered_breakout"])
         text = PerformanceReporter.format_daily(report)
-        assert "macd_momentum" in text
+        assert "trend_filtered_breakout" in text
 
     def test_no_strategies_shows_na(self):
         report = self._make_report(strategies=[])
@@ -273,8 +273,8 @@ class TestPerformanceReporterDB:
         assert report.win_rate_pct == pytest.approx(100.0)
 
     async def test_daily_report_strategies_deduplicated(self):
-        t1 = self._make_trade(side="sell", strategy="rsi_bollinger")
-        t2 = self._make_trade(side="buy", strategy="rsi_bollinger")
+        t1 = self._make_trade(side="sell", strategy="trend_filtered_breakout")
+        t2 = self._make_trade(side="buy", strategy="trend_filtered_breakout")
 
         db = MagicMock()
         session = AsyncMock()
@@ -287,7 +287,7 @@ class TestPerformanceReporterDB:
 
         reporter = PerformanceReporter(db)
         report = await reporter.daily_report(date(2024, 1, 1))
-        assert report.strategies.count("rsi_bollinger") == 1
+        assert report.strategies.count("trend_filtered_breakout") == 1
 
     async def test_weekly_report_spans_7_days(self):
         """weekly_report should call daily_report exactly 7 times."""
@@ -394,7 +394,7 @@ class TestTelegramNotifier:
         notifier = TelegramNotifier(bot_token="TOKEN", chat_id="123")
         notifier.send = AsyncMock(return_value=True)
 
-        await notifier.notify_sell("KRW-ETH", 3_000_000.0, 1.0, 100_000.0, "rsi_bollinger")
+        await notifier.notify_sell("KRW-ETH", 3_000_000.0, 1.0, 100_000.0, "trend_filtered_breakout")
         args = notifier.send.call_args[0][0]
         assert "KRW-ETH" in args
         assert "100,000" in args

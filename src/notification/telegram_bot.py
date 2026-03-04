@@ -93,8 +93,15 @@ class TelegramNotifier:
         quantity: float,
         pnl: float,
         strategy: str,
+        exit_reason: str = "",
     ) -> bool:
-        """Notify on a sell order execution with PnL."""
+        """Notify on a sell order execution with PnL and exit reason.
+
+        Args:
+            exit_reason: Human-readable trigger description, e.g.
+                ``"HARD_STOP(2,850,000): 급락/갭다운 — 진입가 대비 -5.2%"``.
+                If empty, no 사유 line is appended.
+        """
         icon = "🔴" if pnl < 0 else "🔵"
         pnl_pct = pnl / (price * quantity - pnl) * 100 if price * quantity != 0 else 0
         text = (
@@ -105,6 +112,8 @@ class TelegramNotifier:
             f"손익: <code>{pnl:+,.0f} KRW ({pnl_pct:+.2f}%)</code>\n"
             f"전략: <code>{strategy}</code>"
         )
+        if exit_reason:
+            text += f"\n사유: <code>{exit_reason}</code>"
         return await self.send(text)
 
     async def notify_error(self, message: str, critical: bool = False) -> bool:

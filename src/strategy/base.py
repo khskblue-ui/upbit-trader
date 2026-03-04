@@ -39,6 +39,7 @@ class MarketData(BaseModel):
     current_price: float
     orderbook: dict | None = None
     indicators: dict = {}  # pre-computed indicators like {"rsi_14": 35.2}
+    portfolio_balance: float = 0.0  # 실제 사용 가능 KRW 잔액 (TradingEngine이 주입)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 

@@ -48,7 +48,7 @@ class TrendFilteredBreakoutStrategy(BaseStrategy):
         atr_risk_pct (float): Risk fraction per trade (0.01 = 1%). Default 0.01.
         rsi_min (float): Lower RSI bound. Default 45.
         rsi_max (float): Upper RSI bound. Default 70.
-        base_capital (float): Reference capital for ATR sizing (KRW). Default 1_000_000.
+        base_capital (float): Fallback capital for ATR sizing when portfolio balance unavailable (KRW). Default 1_000_000. In live/paper mode, actual account balance is used automatically.
     """
 
     name = "trend_filtered_breakout"
@@ -86,6 +86,8 @@ class TrendFilteredBreakoutStrategy(BaseStrategy):
         rsi_min = float(getattr(self.config, "rsi_min", 45.0))
         rsi_max = float(getattr(self.config, "rsi_max", 70.0))
         base_capital = float(getattr(self.config, "base_capital", 1_000_000.0))
+        # 실제 잔액 우선 사용, 없으면 base_capital fallback (백테스트용)
+        effective_capital = data.portfolio_balance if data.portfolio_balance > 0 else base_capital
 
         # --- Fetch pre-computed indicators ---
         ema_20 = data.indicators.get("ema_20")
@@ -94,7 +96,7 @@ class TrendFilteredBreakoutStrategy(BaseStrategy):
         atr = data.indicators.get("atr_14")
 
         if any(v is None for v in (ema_20, ema_60, rsi, atr)):
-            missing = [k for k, v in {"ema_20": ema_20, "ema_60": ema_60, "rsi_14": rsi, "atr_14": atr}.items() if v is None]
+            missing = [name for name, v in {"ema_20": ema_20, "ema_60": ema_60, "rsi_14": rsi, "atr_14": atr}.items() if v is None]
             return TradeSignal(
                 signal=Signal.HOLD,
                 market=market,
@@ -136,13 +138,10 @@ class TrendFilteredBreakoutStrategy(BaseStrategy):
         # ---------------------------------------------------------------
         # Screen 3: Volatility breakout entry
         # ---------------------------------------------------------------
-        prev = candles[-2]
         current = candles[-1]
-        prev_high = float(prev["high"])
-        prev_low = float(prev["low"])
-        prev_range = prev_high - prev_low
         current_open = float(current["open"])
-        target_price = current_open + prev_range * k
+        # prev_range 대신 ATR(14일 평균 변동폭) 사용 — 단일 세션의 whipsaw 방지
+        target_price = current_open + atr * k
 
         if current_price < target_price:
             return TradeSignal(
@@ -152,7 +151,7 @@ class TrendFilteredBreakoutStrategy(BaseStrategy):
                 reason=(
                     f"[Screen3 FAIL] No breakout: price {current_price:,.0f} "
                     f"< target {target_price:,.0f} "
-                    f"(open {current_open:,.0f} + range {prev_range:,.0f} × k={k})"
+                    f"(open {current_open:,.0f} + ATR {atr:,.0f} × k={k})"
                 ),
                 metadata={"target_price": target_price, "k_value": k},
             )
@@ -162,7 +161,7 @@ class TrendFilteredBreakoutStrategy(BaseStrategy):
         # ---------------------------------------------------------------
 
         # Confidence: blend breakout strength with trend strength
-        breakout_excess = (current_price - target_price) / max(prev_range, 1)
+        breakout_excess = (current_price - target_price) / max(atr, 1)
         trend_strength = min(1.0, (ema_20 - ema_60) / max(ema_60, 1) * 50)
         confidence = round(min(0.90, 0.60 + breakout_excess * 0.15 + trend_strength * 0.05), 3)
 
@@ -170,7 +169,7 @@ class TrendFilteredBreakoutStrategy(BaseStrategy):
         # Risk budget = base_capital × atr_risk_pct
         # Position KRW = (risk_budget / (2 × ATR_KRW)) × current_price
         # = risk_budget × current_price / (2 × ATR_KRW)
-        risk_budget_krw = base_capital * atr_risk_pct
+        risk_budget_krw = effective_capital * atr_risk_pct
         atr_stop_dist = atr * 2.0  # 2-ATR stop distance
         if atr_stop_dist > 0 and current_price > 0:
             # Fraction of one ETH coin = atr_stop_dist / current_price
@@ -178,10 +177,10 @@ class TrendFilteredBreakoutStrategy(BaseStrategy):
             coin_risk_fraction = atr_stop_dist / current_price
             position_krw = risk_budget_krw / coin_risk_fraction
         else:
-            position_krw = base_capital * 0.10  # fallback 10%
+            position_krw = effective_capital * 0.10  # fallback 10%
 
-        # Cap: never more than 20% of base capital per trade
-        max_position_krw = base_capital * 0.20
+        # Cap: never more than 20% of effective capital per trade
+        max_position_krw = effective_capital * 0.20
         position_krw = min(position_krw, max_position_krw)
         position_krw = round(position_krw, -3)  # round to nearest 1,000 KRW
 
@@ -195,7 +194,7 @@ class TrendFilteredBreakoutStrategy(BaseStrategy):
                 f"[ALL SCREENS PASS] "
                 f"EMA20({ema_20:,.0f})>EMA60({ema_60:,.0f}), "
                 f"RSI={rsi:.1f}∈[{rsi_min},{rsi_max}], "
-                f"price({current_price:,.0f})≥target({target_price:,.0f})"
+                f"price({current_price:,.0f})≥target({target_price:,.0f}, ATR×k)"
             ),
             suggested_size=position_krw,
             metadata={

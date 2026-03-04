@@ -26,7 +26,8 @@ class BacktestTrade:
     fee: float
     timestamp: str
     strategy: str
-    pnl: float | None = None  # Realised PnL; set on sell trades only
+    pnl: float | None = None        # Realised PnL; set on sell trades only
+    exit_reason: str | None = None  # "HARD_STOP" / "ATR_TRAIL" / "TIME_EXIT" / "SIGNAL" / "END"
 
 
 @dataclass
@@ -48,6 +49,18 @@ class BacktestEngine:
 
     One position at a time per market (no pyramiding).
     Fees and slippage are applied on every fill.
+
+    Sell algorithm (mirrors TradingEngine 3-layer exit):
+        Layer 1 — HARD_STOP: candle ``low`` ≤ entry × (1 - hard_stop_pct)
+            Fills at hard_stop level (pessimistic).
+        Layer 2 — ATR_TRAIL: candle ``low`` ≤ trailing_stop
+            Trailing stop ratchets up each bar (= one daily session in backtest).
+            Fills at trailing_stop level.
+        Layer 3 — TIME_EXIT: bars_held ≥ max_hold_days
+            Fills at bar's closing price.
+
+    Exit layers are checked before the buy signal each bar to ensure stops
+    are never silently skipped.
     """
 
     def __init__(
@@ -91,9 +104,20 @@ class BacktestEngine:
 
         indicator_names = self.strategy.required_indicators()
 
+        # Read sell config from strategy (with safe defaults)
+        atr_trail_mult = float(getattr(self.strategy.config, "atr_trail_mult", 2.0))
+        hard_stop_pct = float(getattr(self.strategy.config, "hard_stop_pct", 0.05))
+        max_hold_days = int(getattr(self.strategy.config, "max_hold_days", 5))
+
         capital = self.initial_capital
         position_qty: float = 0.0
         position_buy_price: float = 0.0
+
+        # 3-layer exit tracking state
+        position_entry_atr: float = 0.0
+        position_trailing_stop: float = 0.0
+        position_hard_stop: float = 0.0
+        position_buy_bar: int = 0
 
         trades: list[BacktestTrade] = []
         equity_curve: list[float] = []
@@ -103,11 +127,13 @@ class BacktestEngine:
         for i in range(warmup_bars, len(candles)):
             candle = candles[i]
             current_price = float(candle["close"])
+            candle_low = float(candle.get("low", current_price))
             ts = str(candle.get("timestamp", f"bar_{i}"))
 
             # Compute indicators on the window [0 .. i]
             sub_df = df_full.iloc[: i + 1].copy()
             indicators = compute_indicators(sub_df, indicator_names) if indicator_names else {}
+            current_atr = float(indicators.get("atr_14", 0) or position_entry_atr or 0)
 
             market_data = MarketData(
                 market=market,
@@ -116,6 +142,72 @@ class BacktestEngine:
                 indicators=indicators,
             )
 
+            # ------------------------------------------------------------------
+            # 3-Layer Sell Check (executed BEFORE buy signal each bar)
+            # ------------------------------------------------------------------
+            if position_qty > 0.0:
+                exit_reason: str | None = None
+                sell_price = current_price * (1.0 - self.slippage_rate)
+
+                # Layer 1: HARD_STOP — check if candle low breached the floor
+                if candle_low <= position_hard_stop:
+                    sell_price = position_hard_stop * (1.0 - self.slippage_rate)
+                    exit_reason = f"HARD_STOP({position_hard_stop:,.0f})"
+
+                # Layer 2: ATR_TRAIL — check if candle low breached trailing stop
+                elif candle_low <= position_trailing_stop:
+                    sell_price = position_trailing_stop * (1.0 - self.slippage_rate)
+                    exit_reason = f"ATR_TRAIL({position_trailing_stop:,.0f})"
+
+                # Layer 3: TIME_EXIT — max holding period reached
+                elif (i - position_buy_bar) >= max_hold_days:
+                    sell_price = current_price * (1.0 - self.slippage_rate)
+                    exit_reason = (
+                        f"TIME_EXIT({i - position_buy_bar} bars / max {max_hold_days})"
+                    )
+
+                # Update trailing stop (ratchet-up only) — only if no exit this bar
+                if exit_reason is None and current_atr > 0:
+                    new_trail = current_price - atr_trail_mult * current_atr
+                    if new_trail > position_trailing_stop:
+                        position_trailing_stop = new_trail
+
+                if exit_reason:
+                    proceeds = position_qty * sell_price
+                    fee = proceeds * self.fee_rate
+                    net_proceeds = proceeds - fee
+                    pnl = net_proceeds - (position_qty * position_buy_price)
+
+                    capital += net_proceeds
+                    trades.append(
+                        BacktestTrade(
+                            market=market,
+                            side="sell",
+                            price=sell_price,
+                            quantity=position_qty,
+                            fee=fee,
+                            timestamp=ts,
+                            strategy=self.strategy.name,
+                            pnl=pnl,
+                            exit_reason=exit_reason,
+                        )
+                    )
+                    logger.debug(
+                        "[%s] SELL %s %.6f @ %,.0f | pnl=%,.0f | capital=%,.0f",
+                        ts, exit_reason, position_qty, sell_price, pnl, capital,
+                    )
+                    position_qty = 0.0
+                    position_buy_price = 0.0
+                    position_entry_atr = 0.0
+                    position_trailing_stop = 0.0
+                    position_hard_stop = 0.0
+
+                    equity_curve.append(capital)
+                    continue  # Skip signal generation this bar
+
+            # ------------------------------------------------------------------
+            # Strategy signal
+            # ------------------------------------------------------------------
             signal = await self.strategy.generate_signal(market, market_data)
 
             # --- BUY ---
@@ -135,6 +227,12 @@ class BacktestEngine:
                 position_buy_price = exec_price
                 capital -= trade_amount
 
+                # Initialise 3-layer exit state
+                position_entry_atr = current_atr
+                position_trailing_stop = exec_price - atr_trail_mult * current_atr
+                position_hard_stop = exec_price * (1.0 - hard_stop_pct)
+                position_buy_bar = i
+
                 trades.append(
                     BacktestTrade(
                         market=market,
@@ -147,10 +245,12 @@ class BacktestEngine:
                     )
                 )
                 logger.debug(
-                    "[%s] BUY %.6f @ %,.0f | capital=%,.0f", ts, quantity, exec_price, capital
+                    "[%s] BUY %.6f @ %,.0f | capital=%,.0f | hard_stop=%,.0f | trail=%,.0f",
+                    ts, quantity, exec_price, capital,
+                    position_hard_stop, position_trailing_stop,
                 )
 
-            # --- SELL ---
+            # --- SELL (strategy signal fallback) ---
             elif signal.signal == Signal.SELL and position_qty > 0.0:
                 exec_price = current_price * (1.0 - self.slippage_rate)
                 proceeds = position_qty * exec_price
@@ -169,14 +269,18 @@ class BacktestEngine:
                         timestamp=ts,
                         strategy=self.strategy.name,
                         pnl=pnl,
+                        exit_reason="SIGNAL",
                     )
                 )
                 logger.debug(
-                    "[%s] SELL %.6f @ %,.0f | pnl=%,.0f | capital=%,.0f",
+                    "[%s] SELL SIGNAL %.6f @ %,.0f | pnl=%,.0f | capital=%,.0f",
                     ts, position_qty, exec_price, pnl, capital,
                 )
                 position_qty = 0.0
                 position_buy_price = 0.0
+                position_entry_atr = 0.0
+                position_trailing_stop = 0.0
+                position_hard_stop = 0.0
 
             # Mark-to-market portfolio value
             equity_curve.append(capital + position_qty * current_price)
@@ -199,6 +303,7 @@ class BacktestEngine:
                     timestamp=str(candles[-1].get("timestamp", "end")),
                     strategy=self.strategy.name,
                     pnl=pnl,
+                    exit_reason="END",
                 )
             )
             position_qty = 0.0

@@ -1,12 +1,4 @@
 strategies:
-  - name: volatility_breakout
-    enabled: false
-    markets:
-      - KRW-ETH
-    timeframe: "1d"
-    params:
-      k_value: 0.4
-
   - name: trend_filtered_breakout
     enabled: true
     markets:
@@ -17,25 +9,6 @@ strategies:
       atr_risk_pct: 0.01
       rsi_min: 45
       rsi_max: 70
-      base_capital: 1000000
-
-  - name: rsi_bollinger
-    enabled: false
-    markets:
-      - KRW-ETH
-    timeframe: "1h"
-    params:
-      rsi_period: 14
-      bb_period: 20
-      bb_std: 2.0
-
-  - name: macd_momentum
-    enabled: false
-    markets:
-      - KRW-ETH
-    timeframe: "1h"
-    params:
-      fast: 12
-      slow: 26
-      signal_period: 9
-      volume_factor: 1.5
+      atr_trail_mult: 2.0
+      hard_stop_pct: 0.05
+      max_hold_days: 5

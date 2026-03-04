@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pandas as pd
@@ -25,6 +28,44 @@ logger = logging.getLogger(__name__)
 
 _CANDLE_FETCH_COUNT = 100  # candles to fetch per evaluation cycle
 KST = timezone(timedelta(hours=9))
+_POSITIONS_FILE = Path("data/positions.json")
+
+
+def _upbit_session_date(dt: datetime) -> date:
+    """Return the Upbit trading session date for the given datetime.
+
+    Upbit's daily candles reset at 09:00 KST (not midnight).
+    Times before 09:00 KST are still part of the *previous* session.
+
+    Args:
+        dt: Any timezone-aware datetime.
+
+    Returns:
+        The session date (KST-based, 09:00 boundary).
+    """
+    kst = dt.astimezone(KST)
+    if kst.hour < 9:
+        return (kst - timedelta(days=1)).date()
+    return kst.date()
+
+
+@dataclass
+class _PositionInfo:
+    """Per-market open position metadata for stop-loss and exit management.
+
+    Attributes:
+        entry_price: Fill price at the time of purchase (KRW).
+        entry_atr: ATR(14) value at entry — used to set initial trailing stop.
+        trailing_stop: Dynamic stop price, ratchets up with price. Never decreases.
+        hard_stop: Absolute floor price (entry_price × (1 - hard_stop_pct)).
+        buy_session: Upbit session date (09:00 KST boundary) when position opened.
+    """
+
+    entry_price: float
+    entry_atr: float
+    trailing_stop: float
+    hard_stop: float
+    buy_session: date
 
 
 class TradingEngine:
@@ -32,6 +73,16 @@ class TradingEngine:
 
     This class is intentionally a *pure orchestrator*: it holds no trading
     logic itself, delegating all decisions to injected strategy and risk objects.
+
+    Sell algorithm (3-layer exit, checked on every tick):
+        Layer 1 — HARD_STOP: current_price <= entry_price × (1 - hard_stop_pct)
+            Immediate exit on gap-downs or flash crashes. Always executes
+            even if RiskEngine rejects (protective override).
+        Layer 2 — ATR_TRAIL: current_price <= trailing_stop
+            Trailing stop ratchets up once per new Upbit session (09:00 KST).
+            Prevents noise exits within intraday ticks.
+        Layer 3 — TIME_EXIT: sessions_held >= max_hold_days
+            Forces exit after N trading sessions to avoid dead money.
 
     Args:
         strategies: List of :class:`BaseStrategy` instances to run.
@@ -70,8 +121,57 @@ class TradingEngine:
         self._live_executor: BaseExecutor | None = live_executor or (executor if mode == "live" else None)
         self._paper_executor: BaseExecutor | None = paper_executor or (executor if mode in ("paper", "backtest") else None)
 
-        # Track buy date per market for next-session sell logic (KST date)
-        self._buy_dates: dict[str, date] = {}
+        # Open position metadata: market → _PositionInfo
+        # Persisted to _POSITIONS_FILE to survive process restarts.
+        self._positions: dict[str, _PositionInfo] = {}
+
+    # ------------------------------------------------------------------
+    # Position persistence
+    # ------------------------------------------------------------------
+
+    def _save_positions(self) -> None:
+        """Persist open positions to JSON snapshot file.
+
+        Called after every position change (buy, sell, trailing update).
+        """
+        try:
+            _POSITIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                market: {
+                    **asdict(p),
+                    "buy_session": p.buy_session.isoformat(),
+                }
+                for market, p in self._positions.items()
+            }
+            _POSITIONS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        except Exception as exc:
+            logger.error("Failed to save positions snapshot: %s", exc)
+
+    def _load_positions(self) -> None:
+        """Restore positions from JSON snapshot on startup."""
+        if not _POSITIONS_FILE.exists():
+            logger.info("No positions snapshot found at %s — starting fresh.", _POSITIONS_FILE)
+            return
+        try:
+            raw = json.loads(_POSITIONS_FILE.read_text())
+            for market, d in raw.items():
+                self._positions[market] = _PositionInfo(
+                    entry_price=float(d["entry_price"]),
+                    entry_atr=float(d["entry_atr"]),
+                    trailing_stop=float(d["trailing_stop"]),
+                    hard_stop=float(d["hard_stop"]),
+                    buy_session=date.fromisoformat(d["buy_session"]),
+                )
+            logger.info(
+                "Restored %d open position(s) from snapshot: %s",
+                len(self._positions),
+                list(self._positions.keys()),
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to restore positions from snapshot (%s): %s — starting fresh.",
+                _POSITIONS_FILE, exc,
+            )
 
     # ------------------------------------------------------------------
     # Mode switching
@@ -107,7 +207,8 @@ class TradingEngine:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Call ``on_startup`` on all strategies."""
+        """Load persisted positions, then call ``on_startup`` on all strategies."""
+        self._load_positions()
         logger.info("TradingEngine starting with %d strategies.", len(self.strategies))
         for strategy in self.strategies:
             await strategy.on_startup()
@@ -164,9 +265,10 @@ class TradingEngine:
     ) -> None:
         """Evaluate a single strategy/market pair and execute if approved.
 
-        Sell logic (volatility breakout next-session sell):
-          If we hold a position from a previous KST day, sell immediately at
-          current price (simulates selling at next session's open).
+        Sell logic (3-layer exit):
+          Checks HARD_STOP → ATR_TRAIL → TIME_EXIT before the buy signal check.
+          Orphan positions (portfolio holds coin but no _PositionInfo record)
+          are recovered conservatively from DB or via fallback defaults.
 
         Buy logic:
           Ask the strategy for a signal; run through risk engine; execute order.
@@ -175,18 +277,65 @@ class TradingEngine:
         market_data = await self._fetch_market_data(strategy, market)
         if market_data is None:
             return
+        market_data.portfolio_balance = portfolio.available_balance  # ← 실잔액 주입
 
         # ------------------------------------------------------------------
-        # Sell check: if we hold a position from a PREVIOUS trading session
+        # Sell check: 3-layer exit algorithm
         # ------------------------------------------------------------------
         pos = portfolio.positions.get(market, {})
         position_qty = float(pos.get("quantity", 0)) if pos else 0.0
 
-        if position_qty > 0 and market in self._buy_dates:
-            today_kst = datetime.now(KST).date()
-            if today_kst > self._buy_dates[market]:
-                await self._execute_next_session_sell(strategy, market, portfolio, position_qty, market_data)
-                return  # Done for this market this tick
+        if position_qty > 0:
+            if market not in self._positions:
+                # Orphan position: coin held but no entry record (e.g. after restart)
+                await self._recover_orphan_position(market, position_qty, market_data)
+
+            if market in self._positions:
+                pinfo = self._positions[market]
+                current_price = market_data.current_price
+                current_session = _upbit_session_date(datetime.now(KST))
+                sessions_held = (current_session - pinfo.buy_session).days
+
+                # --- Update trailing stop (ratchet-up, once per new session) ---
+                if current_session > pinfo.buy_session:
+                    atr = market_data.indicators.get("atr_14") or pinfo.entry_atr
+                    atr_trail_mult = float(getattr(strategy.config, "atr_trail_mult", 2.0))
+                    new_trail = current_price - atr_trail_mult * atr
+                    if new_trail > pinfo.trailing_stop:
+                        pinfo.trailing_stop = new_trail
+                        self._save_positions()
+                        logger.debug(
+                            "[%s] Trailing stop updated to %.0f (session %s)",
+                            market, pinfo.trailing_stop, current_session,
+                        )
+
+                # --- Determine exit trigger ---
+                max_hold_days = int(getattr(strategy.config, "max_hold_days", 5))
+                exit_reason: str | None = None
+
+                if current_price <= pinfo.hard_stop:
+                    exit_reason = (
+                        f"HARD_STOP({pinfo.hard_stop:,.0f}): "
+                        f"급락/갭다운 — 진입가 대비 "
+                        f"{(current_price / pinfo.entry_price - 1) * 100:.1f}%"
+                    )
+                elif current_price <= pinfo.trailing_stop:
+                    exit_reason = (
+                        f"ATR_TRAIL({pinfo.trailing_stop:,.0f}): "
+                        f"추세 반전 — 트레일링 스탑 터치"
+                    )
+                elif sessions_held >= max_hold_days:
+                    exit_reason = (
+                        f"TIME_EXIT: {sessions_held}세션 보유 "
+                        f"(최대 {max_hold_days}세션, 09:00 KST 기준)"
+                    )
+
+                if exit_reason:
+                    await self._execute_sell(
+                        strategy, market, portfolio,
+                        position_qty, market_data, exit_reason,
+                    )
+                    return  # Done for this market this tick
 
         # ------------------------------------------------------------------
         # Buy check: ask strategy for signal, validate risk, execute
@@ -250,9 +399,20 @@ class TradingEngine:
                 result.quantity, result.price, result.fee, result.order_id,
             )
 
-            # Track buy date for next-session sell
+            # Record position info for 3-layer exit management
             if signal.signal == Signal.BUY:
-                self._buy_dates[market] = datetime.now(KST).date()
+                atr = market_data.indicators.get("atr_14") or 0.0
+                atr_trail_mult = float(getattr(strategy.config, "atr_trail_mult", 2.0))
+                hard_stop_pct = float(getattr(strategy.config, "hard_stop_pct", 0.05))
+                self._positions[market] = _PositionInfo(
+                    entry_price=result.price,
+                    entry_atr=atr,
+                    trailing_stop=result.price - atr_trail_mult * atr,
+                    hard_stop=result.price * (1.0 - hard_stop_pct),
+                    buy_session=_upbit_session_date(datetime.now(KST)),
+                )
+                self._save_positions()
+
                 if self._telegram:
                     await self._telegram.notify_buy(
                         market=market,
@@ -287,18 +447,27 @@ class TradingEngine:
                 )
 
     # ------------------------------------------------------------------
-    # Next-session sell
+    # 3-layer sell execution
     # ------------------------------------------------------------------
 
-    async def _execute_next_session_sell(
+    async def _execute_sell(
         self,
         strategy: BaseStrategy,
         market: str,
         portfolio: PortfolioState,
         quantity: float,
         market_data: MarketData,
+        exit_reason: str,
     ) -> None:
-        """Sell an entire position at the next session's open price (current price)."""
+        """Execute a sell order with full exit context.
+
+        Sell orders are routed through RiskEngine as a courtesy.
+        HARD_STOP and ATR_TRAIL (protective exits) override a REJECT to
+        ensure the position is always closed in safety scenarios.
+
+        Args:
+            exit_reason: Human-readable exit trigger description (e.g. "HARD_STOP(...)").
+        """
         sell_order = OrderRequest(
             market=market,
             side="sell",
@@ -306,6 +475,32 @@ class TradingEngine:
             order_type="market",
             price=market_data.current_price,
         )
+
+        # Protective exits (HARD_STOP, ATR_TRAIL) must always execute
+        is_protective = exit_reason.startswith(("HARD_STOP", "ATR_TRAIL"))
+
+        try:
+            sell_signal = TradeSignal(
+                signal=Signal.SELL,
+                market=market,
+                confidence=1.0,
+                reason=exit_reason,
+            )
+            decision, _ = await self.risk_engine.check(sell_signal, portfolio)
+            if decision == RiskDecision.REJECT and not is_protective:
+                logger.warning(
+                    "[%s] Sell blocked by risk engine (TIME_EXIT): %s", market, exit_reason
+                )
+                return
+            if decision == RiskDecision.REJECT and is_protective:
+                logger.warning(
+                    "[%s] Risk engine rejected protective sell — overriding for safety.", market
+                )
+        except Exception as exc:
+            logger.error(
+                "[%s] Risk engine error during sell — executing anyway: %s", market, exc
+            )
+
         result = await self.executor.execute_order(sell_order)
 
         if result.success:
@@ -314,8 +509,8 @@ class TradingEngine:
             pnl = (result.price - avg_price) * result.quantity - result.fee
 
             logger.info(
-                "[%s] Next-session SELL executed: qty=%.6f @ %.0f pnl=%.2f id=%s",
-                market, result.quantity, result.price, pnl, result.order_id,
+                "[%s] SELL executed (%s): qty=%.6f @ %.0f pnl=%.2f id=%s",
+                market, exit_reason, result.quantity, result.price, pnl, result.order_id,
             )
 
             if self._telegram:
@@ -325,10 +520,12 @@ class TradingEngine:
                     quantity=result.quantity,
                     pnl=pnl,
                     strategy=strategy.name,
+                    exit_reason=exit_reason,
                 )
 
-            # Clear buy date so we can re-enter on next signal
-            self._buy_dates.pop(market, None)
+            # Clear position record and persist
+            self._positions.pop(market, None)
+            self._save_positions()
 
             await strategy.on_trade_executed({
                 "order_id": result.order_id,
@@ -339,11 +536,12 @@ class TradingEngine:
                 "fee": result.fee,
                 "strategy": strategy.name,
                 "pnl": pnl,
+                "exit_reason": exit_reason,
             })
             await self._record_trade(strategy.name, result)
 
         else:
-            logger.error("[%s] Next-session SELL failed: %s", market, result.error)
+            logger.error("[%s] SELL failed (%s): %s", market, exit_reason, result.error)
             if self._telegram:
                 await self._telegram.notify_order_failed(
                     market=market,
@@ -351,6 +549,107 @@ class TradingEngine:
                     error=result.error or "Unknown error",
                     strategy=strategy.name,
                 )
+
+    # ------------------------------------------------------------------
+    # Orphan position recovery
+    # ------------------------------------------------------------------
+
+    async def _recover_orphan_position(
+        self,
+        market: str,
+        quantity: float,
+        market_data: MarketData,
+    ) -> None:
+        """Handle a position that exists in the portfolio but has no entry record.
+
+        This occurs when the process restarts and the snapshot file is missing
+        or corrupt. Recovery attempts:
+          1. Query the DB for the most recent buy trade for this market.
+          2. If found: reconstruct _PositionInfo from recorded entry price/timestamp.
+          3. If not found: apply a conservative fallback — current_price with
+             tight stops, and buy_session set to yesterday so TIME_EXIT fires
+             at the next evaluation.
+        """
+        logger.warning(
+            "[%s] Orphan position detected (qty=%.6f, no entry record). Attempting recovery.",
+            market, quantity,
+        )
+
+        recovered = False
+        if self.db is not None:
+            try:
+                recovered = await self._recover_position_from_db(market, market_data)
+            except Exception as exc:
+                logger.error("[%s] DB recovery failed: %s", market, exc)
+
+        if not recovered:
+            # Conservative fallback: tight stops, yesterday's session → TIME_EXIT fires soon
+            current_price = market_data.current_price
+            atr = market_data.indicators.get("atr_14") or current_price * 0.03
+            yesterday_session = _upbit_session_date(datetime.now(KST)) - timedelta(days=1)
+            self._positions[market] = _PositionInfo(
+                entry_price=current_price,
+                entry_atr=atr,
+                trailing_stop=current_price * 0.97,   # tight 3% trail
+                hard_stop=current_price * 0.95,        # 5% hard floor
+                buy_session=yesterday_session,          # forces TIME_EXIT on next tick
+            )
+            self._save_positions()
+            logger.warning(
+                "[%s] Fallback position record created. "
+                "Will trigger TIME_EXIT at next evaluation.",
+                market,
+            )
+
+    async def _recover_position_from_db(
+        self,
+        market: str,
+        market_data: MarketData,
+    ) -> bool:
+        """Query the trades DB to reconstruct _PositionInfo for *market*.
+
+        Returns:
+            True if recovery succeeded, False otherwise.
+        """
+        try:
+            from sqlalchemy import select, desc
+            async with self.db.get_session() as session:
+                stmt = (
+                    select(Trade)
+                    .where(Trade.market == market, Trade.side == "buy")
+                    .order_by(desc(Trade.timestamp))
+                    .limit(1)
+                )
+                result = await session.execute(stmt)
+                last_buy: Trade | None = result.scalar_one_or_none()
+
+            if last_buy is None:
+                logger.warning("[%s] No buy trade found in DB for recovery.", market)
+                return False
+
+            entry_price = last_buy.price
+            atr = market_data.indicators.get("atr_14") or entry_price * 0.03
+            buy_session = _upbit_session_date(
+                last_buy.timestamp.replace(tzinfo=timezone.utc)
+            )
+
+            self._positions[market] = _PositionInfo(
+                entry_price=entry_price,
+                entry_atr=atr,
+                trailing_stop=entry_price - 2.0 * atr,
+                hard_stop=entry_price * 0.95,
+                buy_session=buy_session,
+            )
+            self._save_positions()
+            logger.info(
+                "[%s] Position recovered from DB: entry=%.0f session=%s",
+                market, entry_price, buy_session,
+            )
+            return True
+
+        except Exception as exc:
+            logger.error("[%s] Error querying DB for recovery: %s", market, exc)
+            return False
 
     # ------------------------------------------------------------------
     # Helpers

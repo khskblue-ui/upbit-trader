@@ -48,16 +48,24 @@ class LiveExecutor(BaseExecutor):
             if order.order_type == "market":
                 if order.side == "buy":
                     # Market buy: specify KRW amount via ``price``
-                    krw_amount = str(int(order.quantity or 0)) if order.quantity else None
+                    krw_amount_int = int(order.quantity or 0)
+                    if krw_amount_int < 5_000:
+                        return OrderResult(
+                            success=False,
+                            market=order.market,
+                            side=order.side,
+                            error=f"Order amount {krw_amount_int:,} KRW is below Upbit minimum (5,000 KRW)",
+                        )
                     raw = await self._client.create_order(
                         market=order.market,
                         side=upbit_side,
-                        price=krw_amount,
+                        price=str(krw_amount_int),
                         ord_type="price",
                     )
                 else:
                     # Market sell: specify coin volume via ``volume``
-                    volume = str(order.quantity) if order.quantity else None
+                    qty = order.quantity or 0.0
+                    volume = f"{qty:.8f}" if qty else None
                     raw = await self._client.create_order(
                         market=order.market,
                         side=upbit_side,
