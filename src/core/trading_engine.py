@@ -163,7 +163,30 @@ class TradingEngine:
         if signal.signal == Signal.HOLD:
             return
 
+        # ── Real-time: signal detected ──────────────────────────────────
+        if self._telegram:
+            await self._telegram.notify_signal(
+                market=market,
+                strategy=strategy.name,
+                signal=signal.signal.value,
+                confidence=signal.confidence,
+                reason=signal.reason or "",
+                metadata=signal.metadata or {},
+            )
+
         decision, results = await self.risk_engine.check(signal, portfolio)
+
+        # ── Real-time: risk check result ─────────────────────────────────
+        if self._telegram:
+            reject_reasons = [r.reason for r in results if r.decision == RiskDecision.REJECT]
+            approve_reasons = [r.reason for r in results if r.decision != RiskDecision.REJECT]
+            all_reasons = reject_reasons or approve_reasons
+            await self._telegram.notify_risk_check(
+                market=market,
+                strategy=strategy.name,
+                decision=decision.value,
+                reasons=all_reasons,
+            )
 
         if decision == RiskDecision.REJECT:
             logger.info(

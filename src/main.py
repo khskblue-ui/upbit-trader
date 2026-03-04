@@ -58,9 +58,10 @@ def _build_risk_rules(rule_configs: list[dict]):
 def _build_strategies(strategy_configs: list[dict]):
     """Instantiate strategy objects from YAML config dicts."""
     # Import concrete strategy modules so they self-register via @register
-    import src.strategy.volatility_breakout  # noqa: F401
-    import src.strategy.rsi_bollinger        # noqa: F401
-    import src.strategy.macd_momentum        # noqa: F401
+    import src.strategy.volatility_breakout       # noqa: F401
+    import src.strategy.rsi_bollinger             # noqa: F401
+    import src.strategy.macd_momentum             # noqa: F401
+    import src.strategy.trend_filtered_breakout   # noqa: F401
 
     from src.strategy.registry import create_strategy
     from src.strategy.base import StrategyConfig

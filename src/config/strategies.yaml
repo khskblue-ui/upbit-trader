@@ -1,17 +1,28 @@
 strategies:
   - name: volatility_breakout
-    enabled: true
+    enabled: false
     markets:
-      - KRW-BTC
       - KRW-ETH
     timeframe: "1d"
     params:
-      k_value: 0.5
+      k_value: 0.4
+
+  - name: trend_filtered_breakout
+    enabled: true
+    markets:
+      - KRW-ETH
+    timeframe: "1d"
+    params:
+      k_value: 0.4
+      atr_risk_pct: 0.01
+      rsi_min: 45
+      rsi_max: 70
+      base_capital: 1000000
 
   - name: rsi_bollinger
     enabled: false
     markets:
-      - KRW-BTC
+      - KRW-ETH
     timeframe: "1h"
     params:
       rsi_period: 14
@@ -21,7 +32,7 @@ strategies:
   - name: macd_momentum
     enabled: false
     markets:
-      - KRW-BTC
+      - KRW-ETH
     timeframe: "1h"
     params:
       fast: 12

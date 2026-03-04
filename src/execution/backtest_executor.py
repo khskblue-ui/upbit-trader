@@ -11,7 +11,7 @@ from src.execution.position_tracker import PositionTracker
 logger = logging.getLogger(__name__)
 
 _UPBIT_FEE_RATE = 0.0005   # 0.05%
-_SLIPPAGE_RATE = 0.0001    # 0.01%
+_SLIPPAGE_RATE = 0.0005    # 0.05% (conservative, network-realistic)
 
 
 class BacktestExecutor(BaseExecutor):

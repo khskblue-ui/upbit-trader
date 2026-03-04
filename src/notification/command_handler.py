@@ -1,14 +1,17 @@
 """Telegram command handler — receive and process user commands from Telegram.
 
 Supported commands:
-    /ping     — Check if the bot is alive
-    /status   — Current balance, positions, mode
-    /strategy — Active strategies and K values
-    /k <val>  — Change k_value (0.1–0.9) for all volatility breakout strategies
-    /pause    — Pause trading (no new orders)
-    /resume   — Resume trading
-    /stop     — Gracefully stop the trading engine
-    /help     — List all commands
+    /ping              — Check if the bot is alive
+    /status            — Current balance, positions, mode
+    /strategy          — Active strategies and parameters
+    /enable <name>     — Enable a strategy by name
+    /disable <name>    — Disable a strategy by name
+    /set <name> <param> <value>  — Change a strategy parameter
+    /k <val>           — Change k_value (0.1–0.9) for all applicable strategies
+    /pause             — Pause trading (no new orders)
+    /resume            — Resume trading
+    /stop              — Gracefully stop the trading engine
+    /help              — List all commands
 """
 
 from __future__ import annotations
@@ -145,6 +148,9 @@ class TelegramCommandHandler:
             "/ping":     self._cmd_ping,
             "/status":   self._cmd_status,
             "/strategy": self._cmd_strategy,
+            "/enable":   self._cmd_enable,
+            "/disable":  self._cmd_disable,
+            "/set":      self._cmd_set,
             "/k":        self._cmd_k,
             "/pause":    self._cmd_pause,
             "/resume":   self._cmd_resume,
@@ -235,6 +241,107 @@ class TelegramCommandHandler:
 
         await self._notifier.send("\n".join(lines))
 
+    async def _cmd_enable(self, args: list[str]) -> None:
+        """Enable a strategy by name."""
+        if not args:
+            names = [s.name for s in self._strategies]
+            await self._notifier.send(
+                f"사용법: /enable &lt;전략명&gt;\n"
+                f"전략 목록: <code>{', '.join(names)}</code>"
+            )
+            return
+
+        target = args[0].lower()
+        matched = [s for s in self._strategies if s.name.lower() == target]
+        if not matched:
+            names = [s.name for s in self._strategies]
+            await self._notifier.send(
+                f"⚠️ 전략을 찾을 수 없음: <code>{target}</code>\n"
+                f"전략 목록: <code>{', '.join(names)}</code>"
+            )
+            return
+
+        strategy = matched[0]
+        strategy.config.enabled = True
+        logger.info("Strategy '%s' enabled via Telegram", strategy.name)
+        await self._notifier.notify_strategy_changed("enable", strategy.name)
+
+    async def _cmd_disable(self, args: list[str]) -> None:
+        """Disable a strategy by name."""
+        if not args:
+            names = [s.name for s in self._strategies]
+            await self._notifier.send(
+                f"사용법: /disable &lt;전략명&gt;\n"
+                f"전략 목록: <code>{', '.join(names)}</code>"
+            )
+            return
+
+        target = args[0].lower()
+        matched = [s for s in self._strategies if s.name.lower() == target]
+        if not matched:
+            names = [s.name for s in self._strategies]
+            await self._notifier.send(
+                f"⚠️ 전략을 찾을 수 없음: <code>{target}</code>\n"
+                f"전략 목록: <code>{', '.join(names)}</code>"
+            )
+            return
+
+        strategy = matched[0]
+        strategy.config.enabled = False
+        logger.info("Strategy '%s' disabled via Telegram", strategy.name)
+        await self._notifier.notify_strategy_changed("disable", strategy.name)
+
+    async def _cmd_set(self, args: list[str]) -> None:
+        """Change a specific parameter on a strategy: /set <name> <param> <value>."""
+        if len(args) < 3:
+            await self._notifier.send(
+                "사용법: /set &lt;전략명&gt; &lt;파라미터&gt; &lt;값&gt;\n"
+                "예시:\n"
+                "  /set trend_filtered_breakout k_value 0.35\n"
+                "  /set trend_filtered_breakout rsi_min 40\n"
+                "  /set trend_filtered_breakout rsi_max 75\n"
+                "  /set trend_filtered_breakout atr_risk_pct 0.015"
+            )
+            return
+
+        target, param, raw_value = args[0].lower(), args[1].lower(), args[2]
+        matched = [s for s in self._strategies if s.name.lower() == target]
+        if not matched:
+            names = [s.name for s in self._strategies]
+            await self._notifier.send(
+                f"⚠️ 전략을 찾을 수 없음: <code>{target}</code>\n"
+                f"전략 목록: <code>{', '.join(names)}</code>"
+            )
+            return
+
+        strategy = matched[0]
+        if not hasattr(strategy.config, param):
+            await self._notifier.send(
+                f"⚠️ 파라미터를 찾을 수 없음: <code>{param}</code>\n"
+                f"해당 전략의 config 속성을 확인해주세요."
+            )
+            return
+
+        # Type-safe conversion
+        try:
+            old_val = getattr(strategy.config, param)
+            if isinstance(old_val, bool):
+                new_val = raw_value.lower() in ("true", "1", "yes")
+            elif isinstance(old_val, int):
+                new_val = int(raw_value)
+            else:
+                new_val = float(raw_value)
+        except (ValueError, TypeError):
+            await self._notifier.send(
+                f"⚠️ 잘못된 값: <code>{raw_value}</code>\n숫자를 입력하세요."
+            )
+            return
+
+        setattr(strategy.config, param, new_val)
+        detail = f"<code>{param}</code>: <code>{old_val}</code> → <code>{new_val}</code>"
+        logger.info("Strategy '%s' param %s: %s -> %s via Telegram", strategy.name, param, old_val, new_val)
+        await self._notifier.notify_strategy_changed("set", strategy.name, detail)
+
     async def _cmd_k(self, args: list[str]) -> None:
         """Change k_value for all volatility breakout strategies (hot-reload)."""
         if not args:
@@ -294,11 +401,19 @@ class TelegramCommandHandler:
         """Show all available commands."""
         text = (
             "📋 <b>[사용 가능한 명령어]</b>\n\n"
+            "<b>📊 모니터링</b>\n"
             "/ping — 봇 작동 여부 확인\n"
             "/status — 현재 잔고 및 포지션\n"
-            "/strategy — 전략 현황 및 설정\n"
-            "/k &lt;값&gt; — K값 변경 (예: /k 0.4, 범위 0.1~0.9)\n"
-            "/pause — 거래 일시정지 (모니터링은 계속)\n"
+            "/strategy — 전략 현황 및 파라미터\n\n"
+            "<b>⚙️ 전략 제어</b>\n"
+            "/enable &lt;전략명&gt; — 전략 활성화\n"
+            "/disable &lt;전략명&gt; — 전략 비활성화\n"
+            "/set &lt;전략명&gt; &lt;파라미터&gt; &lt;값&gt; — 파라미터 변경\n"
+            "  예: /set trend_filtered_breakout k_value 0.35\n"
+            "  예: /set trend_filtered_breakout rsi_min 40\n"
+            "/k &lt;값&gt; — K값 일괄 변경 (범위 0.1~0.9)\n\n"
+            "<b>🎮 운영 제어</b>\n"
+            "/pause — 거래 일시정지 (모니터링 계속)\n"
             "/resume — 거래 재개\n"
             "/stop — 봇 종료\n"
             "/help — 이 메시지 표시"

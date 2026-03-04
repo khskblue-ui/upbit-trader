@@ -172,3 +172,81 @@ class TelegramNotifier:
             f"사유: <code>{error}</code>"
         )
         return await self.send(text)
+
+    async def notify_signal(
+        self,
+        market: str,
+        strategy: str,
+        signal: str,
+        confidence: float,
+        reason: str,
+        metadata: dict | None = None,
+    ) -> bool:
+        """Notify when a trading signal is detected (before risk check)."""
+        icon = "🔔"
+        signal_kor = "매수" if signal == "buy" else "매도" if signal == "sell" else "홀드"
+        lines = [
+            f"{icon} <b>[신호 감지]</b>",
+            f"마켓: <code>{market}</code>",
+            f"전략: <code>{strategy}</code>",
+            f"신호: <code>{signal_kor}</code>",
+            f"신뢰도: <code>{confidence:.1%}</code>",
+            f"근거: {reason}",
+        ]
+        if metadata:
+            detail_keys = ["ema_20", "ema_60", "rsi", "atr_pct", "target_price", "k_value", "position_krw"]
+            detail_lines = []
+            for key in detail_keys:
+                if key in metadata:
+                    val = metadata[key]
+                    if isinstance(val, float) and key not in ("k_value", "rsi", "atr_pct"):
+                        detail_lines.append(f"  {key}: <code>{val:,.0f}</code>")
+                    else:
+                        detail_lines.append(f"  {key}: <code>{val}</code>")
+            if detail_lines:
+                lines.append("─────────────────")
+                lines.extend(detail_lines)
+        return await self.send("\n".join(lines))
+
+    async def notify_risk_check(
+        self,
+        market: str,
+        strategy: str,
+        decision: str,
+        reasons: list[str],
+    ) -> bool:
+        """Notify risk engine decision (APPROVE / MODIFY / REJECT)."""
+        d = decision.lower()
+        if d == "approve":
+            icon, decision_kor = "✅", "승인"
+        elif d == "modify":
+            icon, decision_kor = "⚠️", "수정"
+        else:
+            icon, decision_kor = "🚫", "거절"
+
+        lines = [
+            f"{icon} <b>[리스크 점검: {decision_kor}]</b>",
+            f"마켓: <code>{market}</code>",
+            f"전략: <code>{strategy}</code>",
+        ]
+        for r in reasons:
+            lines.append(f"  • {r}")
+        return await self.send("\n".join(lines))
+
+    async def notify_strategy_changed(
+        self,
+        action: str,
+        strategy_name: str,
+        detail: str = "",
+    ) -> bool:
+        """Notify when a strategy is changed via Telegram command."""
+        icon = {"enable": "▶️", "disable": "⏹️", "set": "⚙️"}.get(action, "ℹ️")
+        action_kor = {"enable": "활성화", "disable": "비활성화", "set": "파라미터 변경"}.get(action, action)
+        text = (
+            f"{icon} <b>[전략 변경]</b>\n"
+            f"전략: <code>{strategy_name}</code>\n"
+            f"작업: <code>{action_kor}</code>"
+        )
+        if detail:
+            text += f"\n상세: {detail}"
+        return await self.send(text)

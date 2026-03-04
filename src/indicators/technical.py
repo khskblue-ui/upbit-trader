@@ -99,6 +99,30 @@ def calculate_bollinger_bands(
     )
 
 
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Compute Average True Range (ATR).
+
+    Args:
+        df: DataFrame with ``high``, ``low``, ``close`` columns.
+        period: Lookback window. Default 14.
+
+    Returns:
+        pd.Series of ATR values, same index as ``df``.
+    """
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+    prev_close = close.shift(1)
+
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    atr = tr.ewm(span=period, min_periods=period, adjust=False).mean()
+    return atr.rename(f"atr_{period}")
+
+
 def calculate_moving_average(df: pd.DataFrame, period: int = 20) -> pd.Series:
     """Compute Simple Moving Average.
 
@@ -199,6 +223,11 @@ def compute_indicators(df: pd.DataFrame, indicator_list: list[str]) -> dict:
                 series = (
                     df["close"].astype(float).ewm(span=period, adjust=False).mean()
                 )
+                result[indicator] = float(series.iloc[-1]) if not series.empty else None
+
+            elif base == "atr":
+                period = int(params[0]) if params else 14
+                series = calculate_atr(df, period=period)
                 result[indicator] = float(series.iloc[-1]) if not series.empty else None
 
             else:
