@@ -313,6 +313,51 @@ class TestMaxPositionSizeRule:
             f"Reason: {result.reason}"
         )
 
+    # ------------------------------------------------------------------
+    # safe_available_balance (Fix 2 — fee/slippage buffer)
+    # ------------------------------------------------------------------
+
+    async def test_safe_available_balance_caps_order_below_raw_balance(self):
+        """max_allowed must be capped at available_balance * 0.999, not raw balance.
+
+        If the requested size exactly equals available_balance, the rule should
+        MODIFY it down to safe_available (0.999 × balance) so that the 0.05%
+        Upbit fee cannot push the total cost over the available funds.
+        """
+        rule = self._rule(
+            max_single_asset_ratio=1.0,   # disable single-asset cap
+            max_total_investment_ratio=1.0,  # disable total-investment cap
+            max_concurrent_positions=5,
+        )
+        available = 1_000_000.0
+        # Request exactly the full available balance — should be trimmed by 0.1%
+        signal = _buy_signal(size=available)
+        portfolio = _portfolio(total=available, available=available)
+
+        result = await rule.evaluate(signal, portfolio)
+
+        # The rule must either MODIFY the size down or APPROVE a size ≤ safe_available
+        safe_available = available * 0.999  # 999_000.0
+        if result.decision == RiskDecision.MODIFY:
+            assert result.modified_size is not None
+            assert result.modified_size <= safe_available, (
+                f"modified_size {result.modified_size} must be ≤ safe_available {safe_available}"
+            )
+        else:
+            # APPROVE is also acceptable only if requested_size ≤ safe_available
+            assert signal.suggested_size <= safe_available or result.decision == RiskDecision.MODIFY
+
+    async def test_safe_available_balance_does_not_reject_reasonable_orders(self):
+        """A small order well within limits must still be approved despite the 0.1% trim."""
+        rule = self._rule()
+        # Request 10% of 10M total — well within all limits
+        signal = _buy_signal(size=1_000_000.0)
+        result = await rule.evaluate(signal, _portfolio())
+        # safe_available = 8_000_000 * 0.999 = 7_992_000 → still far above 1M
+        assert result.decision == RiskDecision.APPROVE, (
+            f"Small order within limits must be approved; got {result.decision}: {result.reason}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # DailyLossLimitRule

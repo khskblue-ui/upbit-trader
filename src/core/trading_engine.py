@@ -30,6 +30,21 @@ _CANDLE_FETCH_COUNT = 100  # candles to fetch per evaluation cycle
 KST = timezone(timedelta(hours=9))
 _POSITIONS_FILE = Path("data/positions.json")
 
+# Keywords in RiskEngine REJECT reasons that indicate infrastructure/system errors.
+# Protective exits (HARD_STOP, ATR_TRAIL) must NOT override these rejections —
+# doing so can trigger crashes due to insufficient funds, API maintenance, etc.
+# Only *policy* violations (position limits, MDD, daily-loss cap, etc.) are
+# overridable; if ANY matched keyword appears in ANY REJECT reason, the override
+# is suppressed and the error is logged for manual intervention.
+_SYSTEM_ERROR_KEYWORDS = frozenset({
+    "insufficient",
+    "maintenance",
+    "unavailable",
+    "connection",
+    "timeout",
+    "network",
+})
+
 
 def _upbit_session_date(dt: datetime) -> date:
     """Return the Upbit trading session date for the given datetime.
@@ -59,6 +74,11 @@ class _PositionInfo:
         trailing_stop: Dynamic stop price, ratchets up with price. Never decreases.
         hard_stop: Absolute floor price (entry_price × (1 - hard_stop_pct)).
         buy_session: Upbit session date (09:00 KST boundary) when position opened.
+        highest_price: Peak price observed since entry.  The trailing stop is
+            computed as ``highest_price - atr_trail_mult * atr`` so that it
+            always reflects the maximum gain and can only ever move up
+            (canonical trailing-stop algorithm).  Initialised to entry_price
+            and updated on every evaluation tick.
     """
 
     entry_price: float
@@ -66,6 +86,7 @@ class _PositionInfo:
     trailing_stop: float
     hard_stop: float
     buy_session: date
+    highest_price: float = 0.0  # peak price since entry; set to entry_price on creation
 
 
 class TradingEngine:
@@ -161,6 +182,8 @@ class TradingEngine:
                     trailing_stop=float(d["trailing_stop"]),
                     hard_stop=float(d["hard_stop"]),
                     buy_session=date.fromisoformat(d["buy_session"]),
+                    # backward-compat: old snapshots lack highest_price; fall back to entry_price
+                    highest_price=float(d.get("highest_price", d["entry_price"])),
                 )
             logger.info(
                 "Restored %d open position(s) from snapshot: %s",
@@ -296,18 +319,32 @@ class TradingEngine:
                 current_session = _upbit_session_date(datetime.now(KST))
                 sessions_held = (current_session - pinfo.buy_session).days
 
-                # --- Update trailing stop (ratchet-up, once per new session) ---
+                # --- Update highest_price tracker (every tick) ---
+                # Must happen BEFORE the trailing-stop recalculation so the new
+                # high is available when we compute the ratchet.
+                needs_save = False
+                if current_price > pinfo.highest_price:
+                    pinfo.highest_price = current_price
+                    needs_save = True
+
+                # --- Update trailing stop based on highest_price (ratchet-up, once per new session) ---
+                # Using highest_price (not current_price) is the canonical trailing-stop
+                # algorithm: the stop can only reflect a genuine new high, never a
+                # temporary intraday pullback.
                 if current_session > pinfo.buy_session:
                     atr = market_data.indicators.get("atr_14") or pinfo.entry_atr
                     atr_trail_mult = float(getattr(strategy.config, "atr_trail_mult", 2.0))
-                    new_trail = current_price - atr_trail_mult * atr
+                    new_trail = pinfo.highest_price - atr_trail_mult * atr
                     if new_trail > pinfo.trailing_stop:
                         pinfo.trailing_stop = new_trail
-                        self._save_positions()
+                        needs_save = True
                         logger.debug(
-                            "[%s] Trailing stop updated to %.0f (session %s)",
-                            market, pinfo.trailing_stop, current_session,
+                            "[%s] Trailing stop updated to %.0f (session %s, peak %.0f)",
+                            market, pinfo.trailing_stop, current_session, pinfo.highest_price,
                         )
+
+                if needs_save:
+                    self._save_positions()
 
                 # --- Determine exit trigger ---
                 max_hold_days = int(getattr(strategy.config, "max_hold_days", 5))
@@ -410,6 +447,7 @@ class TradingEngine:
                     trailing_stop=result.price - atr_trail_mult * atr,
                     hard_stop=result.price * (1.0 - hard_stop_pct),
                     buy_session=_upbit_session_date(datetime.now(KST)),
+                    highest_price=result.price,  # start tracking peak from entry fill price
                 )
                 self._save_positions()
 
@@ -486,15 +524,35 @@ class TradingEngine:
                 confidence=1.0,
                 reason=exit_reason,
             )
-            decision, _ = await self.risk_engine.check(sell_signal, portfolio)
+            decision, results = await self.risk_engine.check(sell_signal, portfolio)
             if decision == RiskDecision.REJECT and not is_protective:
                 logger.warning(
                     "[%s] Sell blocked by risk engine (TIME_EXIT): %s", market, exit_reason
                 )
                 return
             if decision == RiskDecision.REJECT and is_protective:
+                # Safety gate: only override *policy* rejections (position limits,
+                # MDD cap, daily-loss limit, etc.).  If any REJECT reason contains
+                # infrastructure/system-error keywords (insufficient funds, API
+                # maintenance …) we must NOT override — blindly executing the order
+                # in those conditions would cause a crash or an un-fillable order.
+                reject_reasons = [r.reason for r in results if r.decision == RiskDecision.REJECT]
+                system_error_hit = any(
+                    kw in reason.lower()
+                    for reason in reject_reasons
+                    for kw in _SYSTEM_ERROR_KEYWORDS
+                )
+                if system_error_hit:
+                    logger.error(
+                        "[%s] Protective sell BLOCKED — system/infra error detected in "
+                        "REJECT reasons: %s.  Manual intervention required.",
+                        market, reject_reasons,
+                    )
+                    return
                 logger.warning(
-                    "[%s] Risk engine rejected protective sell — overriding for safety.", market
+                    "[%s] Risk engine rejected protective sell (policy violation) — "
+                    "overriding for safety.  Reasons: %s",
+                    market, reject_reasons,
                 )
         except Exception as exc:
             logger.error(
@@ -593,6 +651,7 @@ class TradingEngine:
                 trailing_stop=current_price * 0.97,   # tight 3% trail
                 hard_stop=current_price * 0.95,        # 5% hard floor
                 buy_session=yesterday_session,          # forces TIME_EXIT on next tick
+                highest_price=current_price,            # conservative: current price as peak
             )
             self._save_positions()
             logger.warning(
@@ -639,6 +698,7 @@ class TradingEngine:
                 trailing_stop=entry_price - 2.0 * atr,
                 hard_stop=entry_price * 0.95,
                 buy_session=buy_session,
+                highest_price=entry_price,  # conservative: use entry price as peak
             )
             self._save_positions()
             logger.info(

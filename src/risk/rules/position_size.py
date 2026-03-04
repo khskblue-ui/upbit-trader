@@ -6,6 +6,12 @@ from src.risk.base import BaseRiskRule, PortfolioState, RiskCheckResult, RiskDec
 
 logger = logging.getLogger(__name__)
 
+# Safety margin applied to available_balance before using it as a cap on order size.
+# Upbit charges a 0.05 % maker/taker fee ON TOP of the order amount for market buys,
+# so using the raw available balance can result in "insufficient funds" API errors.
+# Multiplying by 0.999 reserves ≈0.1 % as a combined fee + slippage buffer.
+_SAFE_BALANCE_RATIO: float = 0.999
+
 
 class MaxPositionSizeRule(BaseRiskRule):
     """Enforce limits on single-asset allocation, total investment, and concurrent positions.
@@ -130,7 +136,13 @@ class MaxPositionSizeRule(BaseRiskRule):
             self.max_total_investment_ratio * portfolio.total_balance - total_invested
         )
         max_allowed = min(max_allowed, remaining_capacity)
-        max_allowed = min(max_allowed, portfolio.available_balance)
+
+        # Reserve a fee+slippage buffer: Upbit charges ~0.05 % on market buys ON TOP
+        # of the order amount.  Using the raw available_balance as the cap can cause
+        # "insufficient funds" API rejections when the fee pushes the total cost just
+        # over the balance.  _SAFE_BALANCE_RATIO (0.999) leaves ≈0.1 % headroom.
+        safe_available = portfolio.available_balance * _SAFE_BALANCE_RATIO
+        max_allowed = min(max_allowed, safe_available)
 
         if requested_size <= max_allowed:
             return RiskCheckResult(

@@ -211,6 +211,7 @@ def test_position_persistence_roundtrip(tmp_path: Path):
         trailing_stop=3_020_000.0,
         hard_stop=3_040_000.0,
         buy_session=buy_session,
+        highest_price=3_350_000.0,  # simulate a new high reached after entry
     )
 
     positions_file = tmp_path / "positions.json"
@@ -235,6 +236,7 @@ def test_position_persistence_roundtrip(tmp_path: Path):
             trailing_stop=float(raw[market]["trailing_stop"]),
             hard_stop=float(raw[market]["hard_stop"]),
             buy_session=date.fromisoformat(raw[market]["buy_session"]),
+            highest_price=float(raw[market].get("highest_price", raw[market]["entry_price"])),
         )
 
     original = engine._positions[market]
@@ -243,6 +245,10 @@ def test_position_persistence_roundtrip(tmp_path: Path):
     assert loaded_pinfo.trailing_stop == original.trailing_stop
     assert loaded_pinfo.hard_stop == original.hard_stop
     assert loaded_pinfo.buy_session == original.buy_session
+    assert loaded_pinfo.highest_price == original.highest_price, (
+        f"highest_price must round-trip: saved {original.highest_price}, "
+        f"loaded {loaded_pinfo.highest_price}"
+    )
 
 
 def test_save_load_positions_roundtrip_via_engine(tmp_path: Path):
@@ -257,6 +263,7 @@ def test_save_load_positions_roundtrip_via_engine(tmp_path: Path):
         trailing_stop=89_400_000.0,
         hard_stop=90_250_000.0,
         buy_session=date(2026, 3, 1),
+        highest_price=97_000_000.0,  # simulate a peak 2M above entry
     )
 
     with patch("src.core.trading_engine._POSITIONS_FILE", positions_file):
@@ -278,6 +285,9 @@ def test_save_load_positions_roundtrip_via_engine(tmp_path: Path):
     assert pinfo is not None
     assert pinfo.entry_price == 95_000_000.0
     assert pinfo.buy_session == date(2026, 3, 1)
+    assert pinfo.highest_price == 97_000_000.0, (
+        f"highest_price must survive engine save→load: expected 97_000_000, got {pinfo.highest_price}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +309,7 @@ async def test_hard_stop_triggers_sell(tmp_path: Path):
         trailing_stop=entry_price - 2.0 * 90_000.0,  # 3,020,000
         hard_stop=hard_stop,
         buy_session=date.today() - timedelta(days=2),
+        highest_price=entry_price,
     )
 
     # current_price is well BELOW hard_stop
@@ -331,6 +342,7 @@ async def test_trailing_stop_triggers_sell(tmp_path: Path):
         trailing_stop=trailing_stop,
         hard_stop=entry_price * 0.95,  # 3,040,000 — lower than trailing_stop
         buy_session=date.today() - timedelta(days=2),
+        highest_price=entry_price,
     )
 
     # current_price is BELOW trailing_stop but above hard_stop
@@ -363,6 +375,7 @@ async def test_trailing_stop_ratchets_up_on_new_session(tmp_path: Path):
         hard_stop=entry_price * 0.95,
         # buy_session in the past so current_session > buy_session → update fires
         buy_session=date.today() - timedelta(days=2),
+        highest_price=entry_price,  # tracking starts at entry; will rise to new_price
     )
 
     # Price has risen significantly — new trailing stop should be higher
@@ -404,6 +417,7 @@ async def test_trailing_stop_does_not_decrease(tmp_path: Path):
         hard_stop=entry_price * 0.95,
         # Same session as today → no trailing stop update this tick
         buy_session=date.today(),
+        highest_price=entry_price,
     )
 
     # Price is still above trailing_stop but below where new trail would be
@@ -441,6 +455,7 @@ async def test_time_exit_after_max_hold_days(tmp_path: Path):
         hard_stop=entry_price * 0.95,                  # 3,040,000
         # buy_session is max_hold days ago → sessions_held == max_hold
         buy_session=date.today() - timedelta(days=max_hold),
+        highest_price=entry_price,
     )
 
     # Current price is well above all stops (only TIME_EXIT should trigger)
@@ -471,6 +486,7 @@ async def test_no_sell_when_price_above_all_stops(tmp_path: Path):
         trailing_stop=entry_price - 2.0 * 90_000.0,  # 2,820,000
         hard_stop=entry_price * 0.95,                  # 2,850,000
         buy_session=date.today() - timedelta(days=1),  # held 1 day out of 5
+        highest_price=entry_price,
     )
 
     # Price is clearly above all stops
@@ -520,3 +536,199 @@ async def test_orphan_position_recovery_creates_fallback(tmp_path: Path):
     assert pinfo.hard_stop <= current_price * 0.96, (
         f"Hard stop {pinfo.hard_stop:,.0f} should be ≤ 96% of {current_price:,.0f}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Fix 1 — highest_price tracking and trailing stop from peak
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_highest_price_is_updated_every_tick(tmp_path: Path):
+    """highest_price must be updated on every tick when current_price rises."""
+    engine, strategy, executor = _make_engine(atr_trail_mult=2.0)
+    market = "KRW-ETH"
+    entry_price = 3_000_000.0
+
+    engine._positions[market] = _PositionInfo(
+        entry_price=entry_price,
+        entry_atr=90_000.0,
+        trailing_stop=entry_price - 2.0 * 90_000.0,
+        hard_stop=entry_price * 0.95,
+        buy_session=date.today(),  # same session → no trailing stop ratchet
+        highest_price=entry_price,
+    )
+
+    new_price = 3_400_000.0  # price climbs well above entry
+    market_data = _make_market_data(current_price=new_price, atr=90_000.0)
+    portfolio = _make_portfolio(market=market, qty=0.1, avg_price=entry_price)
+
+    positions_file = tmp_path / "positions.json"
+    with patch("src.core.trading_engine._POSITIONS_FILE", positions_file):
+        with patch.object(engine, "_fetch_market_data", AsyncMock(return_value=market_data)):
+            await engine._evaluate(strategy, market, portfolio)
+
+    pinfo = engine._positions.get(market)
+    assert pinfo is not None
+    assert pinfo.highest_price == new_price, (
+        f"highest_price should be updated to {new_price:,.0f}, got {pinfo.highest_price:,.0f}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_trailing_stop_uses_highest_price_not_current_price(tmp_path: Path):
+    """Trailing stop must be anchored to highest_price, not the current (dipped) price.
+
+    Scenario:
+        Entry: 3,000,000 — peak already reached 3,500,000 (highest_price).
+        Current tick: price has pulled back to 3,400,000 (still above the stop).
+        Expected: trailing stop = highest_price - 2*ATR = 3,500,000 - 180,000 = 3,320,000.
+        Wrong (old) behaviour: trailing stop = 3,400,000 - 180,000 = 3,220,000 (100k too low).
+
+    We use current_price=3,400,000 which is above both the correct (3,320,000) and wrong
+    (3,220,000) trailing-stop values so the position stays open and we can inspect the value.
+    """
+    engine, strategy, executor = _make_engine(atr_trail_mult=2.0)
+    market = "KRW-ETH"
+    entry_price = 3_000_000.0
+    peak_price = 3_500_000.0   # highest ever seen
+    atr = 90_000.0
+
+    # Position was already at peak; price has pulled back but is still above the stop
+    initial_trail = entry_price - 2.0 * atr  # 2,820,000 (set at entry)
+    engine._positions[market] = _PositionInfo(
+        entry_price=entry_price,
+        entry_atr=atr,
+        trailing_stop=initial_trail,
+        hard_stop=entry_price * 0.95,
+        buy_session=date.today() - timedelta(days=1),  # new session → ratchet fires
+        highest_price=peak_price,  # already tracked the peak
+    )
+
+    # 3,400,000 > expected trail (3,320,000) → no sell triggered; position stays open
+    current_price = 3_400_000.0
+    market_data = _make_market_data(current_price=current_price, atr=atr)
+    portfolio = _make_portfolio(market=market, qty=0.1, avg_price=entry_price)
+
+    positions_file = tmp_path / "positions.json"
+    with patch("src.core.trading_engine._POSITIONS_FILE", positions_file):
+        with patch.object(engine, "_fetch_market_data", AsyncMock(return_value=market_data)):
+            await engine._evaluate(strategy, market, portfolio)
+
+    executor.execute_order.assert_not_called(), "Price above trailing stop — no sell expected"
+
+    pinfo = engine._positions.get(market)
+    assert pinfo is not None, "Position should still be open (price above trailing stop)"
+
+    expected_trail = peak_price - 2.0 * atr      # 3,500,000 - 180,000 = 3,320,000
+    wrong_trail = current_price - 2.0 * atr       # 3,400,000 - 180,000 = 3,220,000
+
+    assert pinfo.trailing_stop >= expected_trail, (
+        f"Trailing stop should be anchored to peak ({expected_trail:,.0f}), "
+        f"not to current dip ({wrong_trail:,.0f}). Got {pinfo.trailing_stop:,.0f}"
+    )
+    assert pinfo.trailing_stop > wrong_trail, (
+        "Trailing stop must exceed the old (current-price-based) calculation"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tests: Fix 3 — protective exit blocked on system/infra REJECT
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_protective_exit_blocked_when_system_error_reject(tmp_path: Path):
+    """HARD_STOP protective exit must NOT execute when RiskEngine REJECT is a system error.
+
+    If the REJECT reason contains infrastructure keywords ('insufficient', 'maintenance'
+    …), overriding the rejection can cause a crash. The engine must abort and log
+    instead of force-executing the order.
+    """
+    from src.risk.base import RiskCheckResult
+
+    engine, strategy, executor = _make_engine(hard_stop_pct=0.05)
+    market = "KRW-ETH"
+    entry_price = 3_200_000.0
+
+    engine._positions[market] = _PositionInfo(
+        entry_price=entry_price,
+        entry_atr=90_000.0,
+        trailing_stop=entry_price - 2.0 * 90_000.0,
+        hard_stop=entry_price * 0.95,  # 3,040,000
+        buy_session=date.today() - timedelta(days=1),
+        highest_price=entry_price,
+    )
+
+    # Price triggers HARD_STOP
+    market_data = _make_market_data(current_price=2_900_000.0, atr=90_000.0)
+    portfolio = _make_portfolio(market=market, qty=0.1, avg_price=entry_price)
+
+    # Risk engine REJECTS with a system/infrastructure error reason
+    infra_error_result = RiskCheckResult(
+        decision=RiskDecision.REJECT,
+        rule_name="some_rule",
+        reason="insufficient funds to complete order",
+    )
+    engine.risk_engine.check = AsyncMock(
+        return_value=(RiskDecision.REJECT, [infra_error_result])
+    )
+
+    positions_file = tmp_path / "positions.json"
+    with patch("src.core.trading_engine._POSITIONS_FILE", positions_file):
+        with patch.object(engine, "_fetch_market_data", AsyncMock(return_value=market_data)):
+            await engine._evaluate(strategy, market, portfolio)
+
+    # Order must NOT have been sent — system error blocked the override
+    executor.execute_order.assert_not_called(), (
+        "Sell must be blocked when REJECT reason is a system/infra error"
+    )
+
+
+@pytest.mark.asyncio
+async def test_protective_exit_overrides_policy_reject(tmp_path: Path):
+    """HARD_STOP protective exit MUST override a pure policy REJECT (e.g. MDD limit).
+
+    Policy rejections (MDD, daily-loss, position-size limits) do NOT contain
+    infrastructure keywords, so the protective override should proceed normally.
+    """
+    from src.risk.base import RiskCheckResult
+
+    engine, strategy, executor = _make_engine(hard_stop_pct=0.05)
+    market = "KRW-ETH"
+    entry_price = 3_200_000.0
+
+    engine._positions[market] = _PositionInfo(
+        entry_price=entry_price,
+        entry_atr=90_000.0,
+        trailing_stop=entry_price - 2.0 * 90_000.0,
+        hard_stop=entry_price * 0.95,  # 3,040,000
+        buy_session=date.today() - timedelta(days=1),
+        highest_price=entry_price,
+    )
+
+    # Price triggers HARD_STOP
+    market_data = _make_market_data(current_price=2_900_000.0, atr=90_000.0)
+    portfolio = _make_portfolio(market=market, qty=0.1, avg_price=entry_price)
+
+    # Risk engine REJECTS with a policy reason (no system-error keywords)
+    policy_reject_result = RiskCheckResult(
+        decision=RiskDecision.REJECT,
+        rule_name="mdd_circuit_breaker",
+        reason="MDD limit exceeded: current drawdown 16.0% > 15.0%",
+    )
+    engine.risk_engine.check = AsyncMock(
+        return_value=(RiskDecision.REJECT, [policy_reject_result])
+    )
+
+    positions_file = tmp_path / "positions.json"
+    with patch("src.core.trading_engine._POSITIONS_FILE", positions_file):
+        with patch.object(engine, "_fetch_market_data", AsyncMock(return_value=market_data)):
+            await engine._evaluate(strategy, market, portfolio)
+
+    # Order MUST have been sent — policy reject must be overridden
+    executor.execute_order.assert_called_once(), (
+        "HARD_STOP protective exit must override a policy-only REJECT"
+    )
+    order_arg = executor.execute_order.call_args[0][0]
+    assert order_arg.side == "sell"
