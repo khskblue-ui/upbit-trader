@@ -2,6 +2,12 @@ risk_rules:
   - name: max_position_size
     enabled: true
     max_single_asset_ratio: 0.20
+    # managed_markets: 봇이 실제로 거래하는 마켓 목록.
+    # 이 목록에 포함된 포지션만 total_invested 및 동시 포지션 수 집계에 포함됩니다.
+    # 봇 외부에서 수동 보유 중인 자산(예: BTC)은 집계에서 제외됩니다.
+    # 비워두면 포트폴리오 전체를 집계합니다(하위 호환 동작).
+    managed_markets:
+      - KRW-ETH
     max_total_investment_ratio: 0.70
     max_concurrent_positions: 5
 

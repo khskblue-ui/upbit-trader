@@ -13,8 +13,24 @@ class MaxPositionSizeRule(BaseRiskRule):
     Config keys (all optional):
         enabled (bool): Whether the rule is active. Default True.
         max_single_asset_ratio (float): Max fraction of total_balance for one asset. Default 0.20.
-        max_total_investment_ratio (float): Max fraction of total_balance across all positions. Default 0.70.
-        max_concurrent_positions (int): Max number of open positions. Default 5.
+        max_total_investment_ratio (float): Max fraction of total_balance across all
+            *managed* positions. Default 0.70.
+        max_concurrent_positions (int): Max number of open *managed* positions. Default 5.
+        managed_markets (list[str]): Whitelist of markets the bot actively manages.
+            When non-empty, only positions in this list count toward ``total_invested``
+            and concurrent-position checks.  Positions outside the list (e.g. manually-
+            held BTC) are completely ignored by this rule.
+            When empty (default), ALL portfolio positions are counted (legacy behaviour).
+
+    Example risk.yaml entry::
+
+        - name: max_position_size
+          enabled: true
+          max_single_asset_ratio: 0.20
+          max_total_investment_ratio: 0.70
+          max_concurrent_positions: 5
+          managed_markets:
+            - KRW-ETH
     """
 
     name = "max_position_size"
@@ -25,6 +41,32 @@ class MaxPositionSizeRule(BaseRiskRule):
         self.max_single_asset_ratio: float = config.get("max_single_asset_ratio", 0.20)
         self.max_total_investment_ratio: float = config.get("max_total_investment_ratio", 0.70)
         self.max_concurrent_positions: int = int(config.get("max_concurrent_positions", 5))
+        # Normalise to a set for O(1) lookup; empty set = "count everything"
+        raw_markets = config.get("managed_markets", [])
+        self.managed_markets: set[str] = set(raw_markets) if raw_markets else set()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _managed_positions(self, portfolio: PortfolioState) -> dict:
+        """Return only the positions that this rule manages.
+
+        If ``managed_markets`` is empty, all portfolio positions are returned
+        (backward-compatible behaviour).  Otherwise, only positions whose
+        market key is in ``managed_markets`` are returned.
+        """
+        if not self.managed_markets:
+            return portfolio.positions
+        return {
+            market: pos
+            for market, pos in portfolio.positions.items()
+            if market in self.managed_markets
+        }
+
+    # ------------------------------------------------------------------
+    # Evaluation
+    # ------------------------------------------------------------------
 
     async def evaluate(self, signal, portfolio: PortfolioState) -> RiskCheckResult:
         from src.strategy.base import Signal
@@ -37,12 +79,16 @@ class MaxPositionSizeRule(BaseRiskRule):
                 reason="Non-buy signal; position size check skipped.",
             )
 
-        # --- Check concurrent positions ---
-        num_positions = len(portfolio.positions)
+        managed = self._managed_positions(portfolio)
+
+        # --- Check concurrent positions (managed only) ---
+        num_positions = len(managed)
         if num_positions >= self.max_concurrent_positions:
             reason = (
                 f"Max concurrent positions reached ({num_positions}/{self.max_concurrent_positions})."
             )
+            if self.managed_markets:
+                reason += f" (managed markets: {sorted(self.managed_markets)})"
             logger.warning(reason)
             return RiskCheckResult(
                 decision=RiskDecision.REJECT,
@@ -50,9 +96,9 @@ class MaxPositionSizeRule(BaseRiskRule):
                 reason=reason,
             )
 
-        # --- Check total investment ratio ---
+        # --- Check total investment ratio (managed positions only) ---
         total_invested = sum(
-            pos.get("current_value", 0.0) for pos in portfolio.positions.values()
+            pos.get("current_value", 0.0) for pos in managed.values()
         )
         total_invested_ratio = (
             total_invested / portfolio.total_balance if portfolio.total_balance > 0 else 0.0
@@ -62,6 +108,8 @@ class MaxPositionSizeRule(BaseRiskRule):
                 f"Total investment ratio {total_invested_ratio:.1%} exceeds limit "
                 f"{self.max_total_investment_ratio:.1%}."
             )
+            if self.managed_markets:
+                reason += f" (counting managed positions only: {sorted(self.managed_markets)})"
             logger.warning(reason)
             return RiskCheckResult(
                 decision=RiskDecision.REJECT,

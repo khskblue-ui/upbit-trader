@@ -224,6 +224,95 @@ class TestMaxPositionSizeRule:
         result = await rule.evaluate(_buy_signal(), portfolio)
         assert result.decision == RiskDecision.REJECT
 
+    # ------------------------------------------------------------------
+    # managed_markets filtering
+    # ------------------------------------------------------------------
+
+    async def test_unmanaged_btc_excluded_from_total_invested(self):
+        """Manually-held BTC must NOT count toward total_invested when managed_markets is set.
+
+        Scenario mirrors a real account:
+          - BTC: 10,000,000 KRW (manually held, NOT in managed_markets)
+          - KRW available: 100,000
+          - total_balance: 10,100,000
+
+        Without filtering: 10M / 10.1M = 99% > 70% → REJECT
+        With managed_markets=[KRW-ETH]: 0 managed positions → 0% → APPROVE
+        """
+        rule = self._rule(
+            managed_markets=["KRW-ETH"],
+            max_total_investment_ratio=0.70,
+        )
+        positions = {
+            "KRW-BTC": {"quantity": 0.1, "avg_price": 1e8, "current_value": 10_000_000.0},
+        }
+        portfolio = _portfolio(
+            total=10_100_000.0,
+            available=100_000.0,
+            positions=positions,
+        )
+        signal = TradeSignal(
+            signal=Signal.BUY,
+            market="KRW-ETH",
+            confidence=0.8,
+            reason="test",
+            suggested_size=10_000.0,
+        )
+        result = await rule.evaluate(signal, portfolio)
+        assert result.decision in (RiskDecision.APPROVE, RiskDecision.MODIFY), (
+            f"Unmanaged BTC should be excluded; expected APPROVE/MODIFY, "
+            f"got REJECT. Reason: {result.reason}"
+        )
+
+    async def test_managed_eth_position_still_counts_toward_limit(self):
+        """A bot-managed ETH position MUST still count toward total_invested."""
+        rule = self._rule(
+            managed_markets=["KRW-ETH"],
+            max_total_investment_ratio=0.30,
+        )
+        # ETH (managed) = 5M of total 15.1M = 33.1% > 30% → REJECT
+        positions = {
+            "KRW-ETH": {"quantity": 1, "avg_price": 5e6, "current_value": 5_000_000.0},
+            "KRW-BTC": {"quantity": 0.1, "avg_price": 1e8, "current_value": 10_000_000.0},
+        }
+        portfolio = _portfolio(total=15_100_000.0, available=100_000.0, positions=positions)
+        signal = TradeSignal(
+            signal=Signal.BUY,
+            market="KRW-ETH",
+            confidence=0.8,
+            reason="test",
+            suggested_size=10_000.0,
+        )
+        result = await rule.evaluate(signal, portfolio)
+        assert result.decision == RiskDecision.REJECT, (
+            f"Bot-managed ETH position should still count toward limit. "
+            f"Reason: {result.reason}"
+        )
+
+    async def test_empty_managed_markets_counts_all_positions(self):
+        """When managed_markets is empty, all positions count (backward-compatible)."""
+        rule = self._rule(
+            managed_markets=[],        # empty = legacy behaviour
+            max_total_investment_ratio=0.70,
+        )
+        positions = {
+            "KRW-BTC": {"quantity": 0.1, "avg_price": 1e8, "current_value": 10_000_000.0},
+        }
+        portfolio = _portfolio(total=10_100_000.0, available=100_000.0, positions=positions)
+        signal = TradeSignal(
+            signal=Signal.BUY,
+            market="KRW-ETH",
+            confidence=0.8,
+            reason="test",
+            suggested_size=10_000.0,
+        )
+        result = await rule.evaluate(signal, portfolio)
+        # BTC counts → 99% > 70% → REJECT (old behaviour preserved)
+        assert result.decision == RiskDecision.REJECT, (
+            f"With empty managed_markets, BTC should count → REJECT. "
+            f"Reason: {result.reason}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # DailyLossLimitRule
