@@ -3,6 +3,8 @@ strategies:
     enabled: true
     markets:
       - KRW-ETH
+      - KRW-XRP
+      - KRW-SOL
     timeframe: "1d"
     params:
       k_value: 0.4

@@ -8,6 +8,8 @@ risk_rules:
     # 비워두면 포트폴리오 전체를 집계합니다(하위 호환 동작).
     managed_markets:
       - KRW-ETH
+      - KRW-XRP
+      - KRW-SOL
     max_total_investment_ratio: 0.70
     max_concurrent_positions: 5
 
