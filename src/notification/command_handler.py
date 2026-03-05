@@ -458,7 +458,12 @@ class TelegramCommandHandler:
 
     async def _cmd_briefing(self, args: list[str]) -> None:
         """Manually send the current accumulated briefing and reset the stats window."""
-        await self._engine.send_briefing_now()
+        try:
+            await self._engine.send_briefing_now()
+            await self._notifier.send("✅ <b>브리핑 전송 완료</b>\n통계 창이 초기화되었습니다.")
+        except Exception as exc:
+            logger.error("Failed to send manual briefing: %s", exc)
+            await self._notifier.send(f"⚠️ 브리핑 전송 실패: <code>{exc}</code>")
 
     async def _cmd_mode(self, args: list[str]) -> None:
         """Switch between paper (virtual) and live (real money) trading mode."""

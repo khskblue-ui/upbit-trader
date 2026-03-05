@@ -195,11 +195,19 @@ class IntradayMomentumBreakoutStrategy(BaseStrategy):
         # Using atr*2/price instead would break this invariant because 1h ATR is
         # unrelated to the configured percent stop.
         hard_stop_pct = float(getattr(self.config, "hard_stop_pct", 0.03))
+        if hard_stop_pct <= 0:
+            logger.warning(
+                "[%s] hard_stop_pct is zero or missing — cannot compute position size, skipping trade",
+                market,
+            )
+            return TradeSignal(
+                signal=Signal.HOLD,
+                market=market,
+                confidence=0.0,
+                reason="Config error: hard_stop_pct must be > 0 for safe position sizing",
+            )
         risk_budget_krw = effective_capital * atr_risk_pct
-        if hard_stop_pct > 0:
-            position_krw = risk_budget_krw / hard_stop_pct
-        else:
-            position_krw = effective_capital * 0.10  # fallback 10%
+        position_krw = risk_budget_krw / hard_stop_pct
 
         # Cap: never more than 20% of effective capital per trade
         max_position_krw = effective_capital * 0.20
