@@ -74,8 +74,16 @@ class TelegramNotifier:
         quantity: float,
         strategy: str,
         confidence: float,
+        reason: str = "",
+        metadata: dict | None = None,
     ) -> bool:
-        """Notify on a buy order execution."""
+        """Notify on a buy order execution.
+
+        Args:
+            reason: Human-readable entry rationale from the strategy signal.
+            metadata: Indicator snapshot dict (ema_20, ema_60, rsi, atr_pct,
+                target_price, k_value, position_krw, risk_budget_krw).
+        """
         text = (
             f"🟢 <b>[매수 체결]</b>\n"
             f"마켓: <code>{market}</code>\n"
@@ -84,6 +92,23 @@ class TelegramNotifier:
             f"전략: <code>{strategy}</code>\n"
             f"신뢰도: <code>{confidence:.1%}</code>"
         )
+        if reason:
+            text += f"\n근거: {reason}"
+        if metadata:
+            detail_keys = [
+                "ema_20", "ema_60", "rsi", "atr_pct",
+                "target_price", "k_value", "position_krw", "risk_budget_krw",
+            ]
+            detail_lines = []
+            for key in detail_keys:
+                if key in metadata:
+                    val = metadata[key]
+                    if isinstance(val, float) and key not in ("k_value", "rsi", "atr_pct"):
+                        detail_lines.append(f"  {key}: <code>{val:,.0f}</code>")
+                    else:
+                        detail_lines.append(f"  {key}: <code>{val}</code>")
+            if detail_lines:
+                text += "\n─────────────────\n" + "\n".join(detail_lines)
         return await self.send(text)
 
     async def notify_sell(
@@ -278,3 +303,66 @@ class TelegramNotifier:
         else:
             text += "📄 가상 자금으로 거래합니다."
         return await self.send(text)
+
+    async def notify_hourly_briefing(
+        self,
+        hour_label: str,
+        error_count: int,
+        error_messages: list[str],
+        trade_executed: bool,
+        market_hold_reasons: dict[str, str],
+        market_indicators: dict[str, dict],
+    ) -> bool:
+        """Send an hourly status & entry-condition briefing.
+
+        Args:
+            hour_label: Human-readable window string, e.g. ``"14:00~15:00 KST"``.
+            error_count: Number of exceptions caught during the hour.
+            error_messages: Short descriptions of each error (capped at 3 in the message).
+            trade_executed: True when at least one buy or sell completed this hour.
+            market_hold_reasons: market → last HOLD reason string for that market.
+            market_indicators: market → indicator snapshot dict
+                (keys: ema_20, ema_60, rsi, current_price, target_price).
+        """
+        lines = [f"⏰ <b>[시간별 브리핑 — {hour_label}]</b>"]
+
+        # ── Error section ──────────────────────────────────────────────
+        if error_count > 0:
+            lines.append("")
+            lines.append(f"🚨 <b>오류 발생: {error_count}건</b>")
+            for msg in error_messages[-3:]:   # 최대 3개 표시
+                lines.append(f"  • {msg[:120]}")
+        else:
+            lines.append("✅ 오류 없음")
+
+        # ── Trade section ───────────────────────────────────────────────
+        if trade_executed:
+            lines.append("✅ 이 시간 내 매매 실행됨 (체결 알림 참고)")
+        else:
+            lines.append("")
+            lines.append("📊 <b>매매 미발생 — 진입 조건 분석</b>")
+
+            if not market_hold_reasons:
+                lines.append("  (평가 데이터 없음)")
+            else:
+                for market, reason in market_hold_reasons.items():
+                    lines.append("")
+                    lines.append(f"<b>{market}</b>")
+                    lines.append(f"  {reason}")
+                    ind = market_indicators.get(market, {})
+                    if ind:
+                        parts: list[str] = []
+                        if "ema_20" in ind and "ema_60" in ind:
+                            parts.append(
+                                f"EMA20={ind['ema_20']:,.0f} / EMA60={ind['ema_60']:,.0f}"
+                            )
+                        if "rsi" in ind:
+                            parts.append(f"RSI={ind['rsi']:.1f}")
+                        if "current_price" in ind:
+                            parts.append(f"현가={ind['current_price']:,.0f}")
+                        if "target_price" in ind:
+                            parts.append(f"목표={ind['target_price']:,.0f}")
+                        if parts:
+                            lines.append("  📈 " + " | ".join(parts))
+
+        return await self.send("\n".join(lines))

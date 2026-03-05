@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -89,6 +89,31 @@ class _PositionInfo:
     highest_price: float = 0.0  # peak price since entry; set to entry_price on creation
 
 
+@dataclass
+class _HourlyStats:
+    """Accumulated stats for the current 1-hour monitoring window.
+
+    Reset every hour just after the briefing is sent.
+
+    Attributes:
+        start_time: When this window began (KST).
+        error_count: Total exceptions caught in ``_tick()`` this hour.
+        error_messages: Short description of each error (newest last).
+        trade_executed: True when at least one buy or sell completed.
+        last_hold_reasons: market → last HOLD reason string seen this hour.
+            Overwritten on each tick so only the most recent state is kept.
+        last_indicators: market → indicator snapshot dict
+            (ema_20, ema_60, rsi, current_price, target_price).
+    """
+
+    start_time: datetime
+    error_count: int = 0
+    error_messages: list[str] = field(default_factory=list)
+    trade_executed: bool = False
+    last_hold_reasons: dict[str, str] = field(default_factory=dict)
+    last_indicators: dict[str, dict] = field(default_factory=dict)
+
+
 class TradingEngine:
     """Orchestrate the full trading loop: data collection → signal → risk → order.
 
@@ -145,6 +170,9 @@ class TradingEngine:
         # Open position metadata: market → _PositionInfo
         # Persisted to _POSITIONS_FILE to survive process restarts.
         self._positions: dict[str, _PositionInfo] = {}
+
+        # Rolling 1-hour stats window for the hourly Telegram briefing.
+        self._hourly_stats = _HourlyStats(start_time=datetime.now(KST))
 
     # ------------------------------------------------------------------
     # Position persistence
@@ -245,8 +273,15 @@ class TradingEngine:
             await strategy.on_shutdown()
 
     async def run(self) -> None:
-        """Main event loop — runs until :meth:`stop` is called."""
+        """Main event loop — runs until :meth:`stop` is called.
+
+        Launches a background hourly-briefing task alongside the main tick loop.
+        Both tasks are cancelled cleanly on exit.
+        """
         await self.start()
+        briefing_task = asyncio.create_task(
+            self._hourly_briefing_loop(), name="hourly-briefing"
+        )
         try:
             while self._running:
                 await self._tick()
@@ -254,6 +289,11 @@ class TradingEngine:
         except asyncio.CancelledError:
             logger.info("TradingEngine cancelled.")
         finally:
+            briefing_task.cancel()
+            try:
+                await briefing_task
+            except asyncio.CancelledError:
+                pass
             await self.stop()
 
     # ------------------------------------------------------------------
@@ -278,6 +318,10 @@ class TradingEngine:
                     logger.error(
                         "Error evaluating %s for %s: %s",
                         strategy.name, market, exc, exc_info=True,
+                    )
+                    self._hourly_stats.error_count += 1
+                    self._hourly_stats.error_messages.append(
+                        f"[{market}] {str(exc)[:120]}"
                     )
 
     async def _evaluate(
@@ -384,6 +428,21 @@ class TradingEngine:
         )
 
         if signal.signal == Signal.HOLD:
+            # Track the HOLD reason and current indicator snapshot for the hourly briefing.
+            self._hourly_stats.last_hold_reasons[market] = signal.reason or ""
+            ind_snap: dict = {}
+            for key in ("ema_20", "ema_60", "rsi_14", "atr_14"):
+                v = market_data.indicators.get(key)
+                if v is not None:
+                    # Normalize rsi_14 → rsi for display consistency
+                    out_key = "rsi" if key == "rsi_14" else key
+                    ind_snap[out_key] = v
+            ind_snap["current_price"] = market_data.current_price
+            if signal.metadata and "target_price" in signal.metadata:
+                ind_snap["target_price"] = signal.metadata["target_price"]
+            if signal.metadata and "rsi" in signal.metadata:
+                ind_snap["rsi"] = signal.metadata["rsi"]
+            self._hourly_stats.last_indicators[market] = ind_snap
             return
 
         # ── Real-time: signal detected ──────────────────────────────────
@@ -450,6 +509,7 @@ class TradingEngine:
                     highest_price=result.price,  # start tracking peak from entry fill price
                 )
                 self._save_positions()
+                self._hourly_stats.trade_executed = True
 
                 if self._telegram:
                     await self._telegram.notify_buy(
@@ -458,6 +518,8 @@ class TradingEngine:
                         quantity=result.quantity,
                         strategy=strategy.name,
                         confidence=signal.confidence,
+                        reason=signal.reason or "",
+                        metadata=signal.metadata,
                     )
 
             await strategy.on_trade_executed({
@@ -584,6 +646,7 @@ class TradingEngine:
             # Clear position record and persist
             self._positions.pop(market, None)
             self._save_positions()
+            self._hourly_stats.trade_executed = True
 
             await strategy.on_trade_executed({
                 "order_id": result.order_id,
@@ -710,6 +773,38 @@ class TradingEngine:
         except Exception as exc:
             logger.error("[%s] Error querying DB for recovery: %s", market, exc)
             return False
+
+    # ------------------------------------------------------------------
+    # Hourly briefing
+    # ------------------------------------------------------------------
+
+    async def _hourly_briefing_loop(self) -> None:
+        """Background task: send a Telegram briefing every hour, then reset stats."""
+        while self._running:
+            await asyncio.sleep(3600)
+            if not self._running:
+                break
+            await self._send_hourly_briefing()
+            # Reset window — start_time anchors to now for the next hour label
+            self._hourly_stats = _HourlyStats(start_time=datetime.now(KST))
+
+    async def _send_hourly_briefing(self) -> None:
+        """Format and dispatch the hourly Telegram briefing from accumulated stats."""
+        if self._telegram is None:
+            return
+        stats = self._hourly_stats
+        now = datetime.now(KST)
+        hour_label = (
+            f"{stats.start_time.strftime('%H:%M')}~{now.strftime('%H:%M')} KST"
+        )
+        await self._telegram.notify_hourly_briefing(
+            hour_label=hour_label,
+            error_count=stats.error_count,
+            error_messages=stats.error_messages,
+            trade_executed=stats.trade_executed,
+            market_hold_reasons=stats.last_hold_reasons,
+            market_indicators=stats.last_indicators,
+        )
 
     # ------------------------------------------------------------------
     # Helpers
