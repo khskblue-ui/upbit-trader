@@ -182,14 +182,22 @@ class IntradayMomentumBreakoutStrategy(BaseStrategy):
         trend_strength = min(1.0, (ema_24 - ema_120) / max(ema_120, 1) * 50)
         confidence = round(min(0.90, 0.60 + breakout_excess * 0.15 + trend_strength * 0.05), 3)
 
-        # ATR position sizing (Turtle Trading 1% risk rule, using ATR_24)
-        # Risk budget = effective_capital × atr_risk_pct
-        # Position KRW = (risk_budget / (2 × ATR_KRW)) × current_price
+        # Percent-based position sizing (1% risk rule aligned with hard_stop_pct)
+        # IMB uses a percent-based hard stop (not ATR-based), so the stop distance
+        # expressed as a fraction of position value IS hard_stop_pct itself.
+        #
+        # Risk budget  = effective_capital × atr_risk_pct       (e.g. 10,000 KRW)
+        # coin_risk_fraction = hard_stop_pct                     (e.g. 0.03 = 3%)
+        # position_krw = risk_budget / hard_stop_pct             (e.g. 333,333 KRW)
+        #
+        # This is mathematically consistent: if the stop fires at -3%, a position
+        # of 333,333 KRW loses exactly 10,000 KRW (= 1% of 1,000,000 KRW capital).
+        # Using atr*2/price instead would break this invariant because 1h ATR is
+        # unrelated to the configured percent stop.
+        hard_stop_pct = float(getattr(self.config, "hard_stop_pct", 0.03))
         risk_budget_krw = effective_capital * atr_risk_pct
-        atr_stop_dist = atr * 2.0  # 2-ATR stop distance
-        if atr_stop_dist > 0 and current_price > 0:
-            coin_risk_fraction = atr_stop_dist / current_price
-            position_krw = risk_budget_krw / coin_risk_fraction
+        if hard_stop_pct > 0:
+            position_krw = risk_budget_krw / hard_stop_pct
         else:
             position_krw = effective_capital * 0.10  # fallback 10%
 

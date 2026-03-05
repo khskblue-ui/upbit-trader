@@ -861,6 +861,16 @@ class TradingEngine:
             market_indicators=stats.last_indicators,
         )
 
+    async def send_briefing_now(self) -> None:
+        """Manually trigger a briefing for the current window and reset the stats.
+
+        Called by the Telegram ``/briefing`` command.  Behaviour is identical to
+        the automated hourly briefing: the accumulated window is sent and then
+        reset so the next window starts fresh from now.
+        """
+        await self._send_hourly_briefing()
+        self._hourly_stats = _HourlyStats(start_time=datetime.now(KST))
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

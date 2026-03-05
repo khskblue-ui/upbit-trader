@@ -10,6 +10,7 @@ Supported commands:
     /k <val>           — Change k_value (0.1–0.9) for all applicable strategies
     /switchstrategy <name|alias>  — Switch to a strategy exclusively (enables one, disables all others)
                                     Aliases: tfvb (trend_filtered_breakout), imb (intraday_momentum_breakout)
+    /briefing          — Send the current accumulated briefing now and reset the window
     /mode <paper|live> — Switch trading mode (paper = virtual, live = real money)
     /pause             — Pause trading (no new orders)
     /resume            — Resume trading
@@ -156,6 +157,7 @@ class TelegramCommandHandler:
             "/set":              self._cmd_set,
             "/k":                self._cmd_k,
             "/switchstrategy":   self._cmd_switchstrategy,
+            "/briefing":         self._cmd_briefing,
             "/mode":             self._cmd_mode,
             "/pause":            self._cmd_pause,
             "/resume":           self._cmd_resume,
@@ -454,6 +456,10 @@ class TelegramCommandHandler:
             f"{disabled_text}"
         )
 
+    async def _cmd_briefing(self, args: list[str]) -> None:
+        """Manually send the current accumulated briefing and reset the stats window."""
+        await self._engine.send_briefing_now()
+
     async def _cmd_mode(self, args: list[str]) -> None:
         """Switch between paper (virtual) and live (real money) trading mode."""
         current_mode = self._engine._mode
@@ -529,6 +535,7 @@ class TelegramCommandHandler:
             "  tfvb: 일봉 전략 (EMA20/60, 일봉)\n"
             "  imb: 1시간봉 전략 (EMA24/120, 60m)\n\n"
             "<b>🎮 운영 제어</b>\n"
+            "/briefing — 현재 구간 브리핑 즉시 전송 및 창 초기화\n"
             "/mode &lt;paper|live&gt; — 모드 전환 (모의투자 ↔ 실거래)\n"
             "/pause — 거래 일시정지 (모니터링 계속)\n"
             "/resume — 거래 재개\n"
