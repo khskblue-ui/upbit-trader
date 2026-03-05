@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_CANDLE_FETCH_COUNT = 100  # candles to fetch per evaluation cycle
+_CANDLE_FETCH_COUNT = 200  # candles to fetch per evaluation cycle (EMA(120) needs ≥125)
 KST = timezone(timedelta(hours=9))
 _POSITIONS_FILE = Path("data/positions.json")
 
@@ -70,15 +70,18 @@ class _PositionInfo:
 
     Attributes:
         entry_price: Fill price at the time of purchase (KRW).
-        entry_atr: ATR(14) value at entry — used to set initial trailing stop.
+        entry_atr: ATR value at entry — used to set initial ATR-based trailing stop.
         trailing_stop: Dynamic stop price, ratchets up with price. Never decreases.
         hard_stop: Absolute floor price (entry_price × (1 - hard_stop_pct)).
         buy_session: Upbit session date (09:00 KST boundary) when position opened.
         highest_price: Peak price observed since entry.  The trailing stop is
-            computed as ``highest_price - atr_trail_mult * atr`` so that it
-            always reflects the maximum gain and can only ever move up
-            (canonical trailing-stop algorithm).  Initialised to entry_price
-            and updated on every evaluation tick.
+            computed as ``highest_price - atr_trail_mult * atr`` (ATR-based) or
+            ``highest_price * (1 - trailing_stop_pct)`` (percent-based) so that it
+            always reflects the maximum gain and can only ever move up.
+            Initialised to entry_price and updated on every evaluation tick.
+        buy_datetime: UTC datetime of the fill.  Used for ``max_hold_hours`` time
+            exit (1h strategies).  ``None`` for positions restored from old snapshots
+            that pre-date this field.
     """
 
     entry_price: float
@@ -87,6 +90,7 @@ class _PositionInfo:
     hard_stop: float
     buy_session: date
     highest_price: float = 0.0  # peak price since entry; set to entry_price on creation
+    buy_datetime: datetime | None = None  # UTC fill time; enables max_hold_hours exit
 
 
 @dataclass
@@ -189,6 +193,8 @@ class TradingEngine:
                 market: {
                     **asdict(p),
                     "buy_session": p.buy_session.isoformat(),
+                    # Override non-JSON-serializable datetime with ISO string
+                    "buy_datetime": p.buy_datetime.isoformat() if p.buy_datetime else None,
                 }
                 for market, p in self._positions.items()
             }
@@ -204,6 +210,7 @@ class TradingEngine:
         try:
             raw = json.loads(_POSITIONS_FILE.read_text())
             for market, d in raw.items():
+                _raw_dt = d.get("buy_datetime")
                 self._positions[market] = _PositionInfo(
                     entry_price=float(d["entry_price"]),
                     entry_atr=float(d["entry_atr"]),
@@ -212,6 +219,8 @@ class TradingEngine:
                     buy_session=date.fromisoformat(d["buy_session"]),
                     # backward-compat: old snapshots lack highest_price; fall back to entry_price
                     highest_price=float(d.get("highest_price", d["entry_price"])),
+                    # backward-compat: old snapshots lack buy_datetime
+                    buy_datetime=datetime.fromisoformat(_raw_dt) if _raw_dt else None,
                 )
             logger.info(
                 "Restored %d open position(s) from snapshot: %s",
@@ -371,11 +380,26 @@ class TradingEngine:
                     pinfo.highest_price = current_price
                     needs_save = True
 
-                # --- Update trailing stop based on highest_price (ratchet-up, once per new session) ---
-                # Using highest_price (not current_price) is the canonical trailing-stop
-                # algorithm: the stop can only reflect a genuine new high, never a
-                # temporary intraday pullback.
-                if current_session > pinfo.buy_session:
+                # --- Update trailing stop based on highest_price (ratchet-up) ---
+                # Strategy-aware: percent-based (IMB) updates every tick for fine-grained
+                # intraday protection; ATR-based (TFVB) updates once per new Upbit session
+                # (09:00 KST) to prevent noise exits within the same trading day.
+                _pct_raw = getattr(strategy.config, "trailing_stop_pct", None)
+                trailing_stop_pct = float(_pct_raw) if isinstance(_pct_raw, (int, float)) else 0.0
+
+                if trailing_stop_pct > 0:
+                    # Percent-based trailing stop — refresh on every tick
+                    new_trail = pinfo.highest_price * (1.0 - trailing_stop_pct)
+                    if new_trail > pinfo.trailing_stop:
+                        pinfo.trailing_stop = new_trail
+                        needs_save = True
+                        logger.debug(
+                            "[%s] Pct trailing stop → %.0f (peak %.0f, pct=%.1f%%)",
+                            market, pinfo.trailing_stop, pinfo.highest_price,
+                            trailing_stop_pct * 100,
+                        )
+                elif current_session > pinfo.buy_session:
+                    # ATR-based trailing stop — update once per new Upbit session
                     atr = market_data.indicators.get("atr_14") or pinfo.entry_atr
                     atr_trail_mult = float(getattr(strategy.config, "atr_trail_mult", 2.0))
                     new_trail = pinfo.highest_price - atr_trail_mult * atr
@@ -383,7 +407,7 @@ class TradingEngine:
                         pinfo.trailing_stop = new_trail
                         needs_save = True
                         logger.debug(
-                            "[%s] Trailing stop updated to %.0f (session %s, peak %.0f)",
+                            "[%s] ATR trailing stop → %.0f (session %s, peak %.0f)",
                             market, pinfo.trailing_stop, current_session, pinfo.highest_price,
                         )
 
@@ -392,6 +416,8 @@ class TradingEngine:
 
                 # --- Determine exit trigger ---
                 max_hold_days = int(getattr(strategy.config, "max_hold_days", 5))
+                _max_h = getattr(strategy.config, "max_hold_hours", None)
+                max_hold_hours_cfg = float(_max_h) if isinstance(_max_h, (int, float)) else None
                 exit_reason: str | None = None
 
                 if current_price <= pinfo.hard_stop:
@@ -401,10 +427,21 @@ class TradingEngine:
                         f"{(current_price / pinfo.entry_price - 1) * 100:.1f}%"
                     )
                 elif current_price <= pinfo.trailing_stop:
+                    trail_label = "PCT_TRAIL" if trailing_stop_pct > 0 else "ATR_TRAIL"
                     exit_reason = (
-                        f"ATR_TRAIL({pinfo.trailing_stop:,.0f}): "
+                        f"{trail_label}({pinfo.trailing_stop:,.0f}): "
                         f"추세 반전 — 트레일링 스탑 터치"
                     )
+                elif max_hold_hours_cfg is not None and pinfo.buy_datetime is not None:
+                    # Hours-based time exit (IMB 1h strategy)
+                    hours_held = (
+                        datetime.now(timezone.utc) - pinfo.buy_datetime
+                    ).total_seconds() / 3600
+                    if hours_held >= max_hold_hours_cfg:
+                        exit_reason = (
+                            f"TIME_EXIT: {hours_held:.1f}시간 보유 "
+                            f"(최대 {max_hold_hours_cfg:.0f}시간)"
+                        )
                 elif sessions_held >= max_hold_days:
                     exit_reason = (
                         f"TIME_EXIT: {sessions_held}세션 보유 "
@@ -431,11 +468,12 @@ class TradingEngine:
             # Track the HOLD reason and current indicator snapshot for the hourly briefing.
             self._hourly_stats.last_hold_reasons[market] = signal.reason or ""
             ind_snap: dict = {}
-            for key in ("ema_20", "ema_60", "rsi_14", "atr_14"):
+            # Cover both daily TFVB (ema_20/ema_60/atr_14) and 1h IMB (ema_24/ema_120/atr_24)
+            for key in ("ema_20", "ema_60", "ema_24", "ema_120", "rsi_14", "atr_14", "atr_24"):
                 v = market_data.indicators.get(key)
                 if v is not None:
-                    # Normalize rsi_14 → rsi for display consistency
-                    out_key = "rsi" if key == "rsi_14" else key
+                    # Normalize rsi_NN → "rsi" for display consistency
+                    out_key = "rsi" if key.startswith("rsi_") else key
                     ind_snap[out_key] = v
             ind_snap["current_price"] = market_data.current_price
             if signal.metadata and "target_price" in signal.metadata:
@@ -497,16 +535,30 @@ class TradingEngine:
 
             # Record position info for 3-layer exit management
             if signal.signal == Signal.BUY:
-                atr = market_data.indicators.get("atr_14") or 0.0
-                atr_trail_mult = float(getattr(strategy.config, "atr_trail_mult", 2.0))
+                # Use the best available ATR indicator (strategy-agnostic)
+                entry_atr = (
+                    market_data.indicators.get("atr_14")
+                    or market_data.indicators.get("atr_24")
+                    or 0.0
+                )
                 hard_stop_pct = float(getattr(strategy.config, "hard_stop_pct", 0.05))
+                _pct_raw2 = getattr(strategy.config, "trailing_stop_pct", None)
+                _pct = float(_pct_raw2) if isinstance(_pct_raw2, (int, float)) else 0.0
+                if _pct > 0:
+                    # Percent-based initial trailing stop (IMB strategy)
+                    initial_trailing_stop = result.price * (1.0 - _pct)
+                else:
+                    # ATR-based initial trailing stop (TFVB strategy)
+                    atr_trail_mult = float(getattr(strategy.config, "atr_trail_mult", 2.0))
+                    initial_trailing_stop = result.price - atr_trail_mult * entry_atr
                 self._positions[market] = _PositionInfo(
                     entry_price=result.price,
-                    entry_atr=atr,
-                    trailing_stop=result.price - atr_trail_mult * atr,
+                    entry_atr=entry_atr,
+                    trailing_stop=initial_trailing_stop,
                     hard_stop=result.price * (1.0 - hard_stop_pct),
                     buy_session=_upbit_session_date(datetime.now(KST)),
                     highest_price=result.price,  # start tracking peak from entry fill price
+                    buy_datetime=datetime.now(timezone.utc),  # enables max_hold_hours exit
                 )
                 self._save_positions()
                 self._hourly_stats.trade_executed = True
@@ -715,6 +767,8 @@ class TradingEngine:
                 hard_stop=current_price * 0.95,        # 5% hard floor
                 buy_session=yesterday_session,          # forces TIME_EXIT on next tick
                 highest_price=current_price,            # conservative: current price as peak
+                # Set buy_datetime 25h ago → triggers max_hold_hours exit on next tick
+                buy_datetime=datetime.now(timezone.utc) - timedelta(hours=25),
             )
             self._save_positions()
             logger.warning(
@@ -762,6 +816,7 @@ class TradingEngine:
                 hard_stop=entry_price * 0.95,
                 buy_session=buy_session,
                 highest_price=entry_price,  # conservative: use entry price as peak
+                buy_datetime=last_buy.timestamp.replace(tzinfo=timezone.utc),
             )
             self._save_positions()
             logger.info(

@@ -14,3 +14,21 @@ strategies:
       atr_trail_mult: 2.0
       hard_stop_pct: 0.05
       max_hold_days: 5
+
+  # 1시간봉 단기 모멘텀 돌파 전략 (IMB)
+  # 기본값: 비활성화 (텔레그램 /switchstrategy imb 로 전환)
+  - name: intraday_momentum_breakout
+    enabled: false
+    markets:
+      - KRW-ETH
+      - KRW-XRP
+      - KRW-SOL
+    timeframe: "60m"
+    params:
+      k_value: 1.5           # 1h ATR 기반 돌파 계수 (일봉 0.4보다 큼)
+      atr_risk_pct: 0.01     # 거래당 리스크 비율 1%
+      rsi_min: 50            # RSI 하한 (일봉보다 타이트)
+      rsi_max: 75            # RSI 상한
+      hard_stop_pct: 0.03    # 진입가 대비 3% 하드스탑
+      trailing_stop_pct: 0.03  # 최고가 대비 3% 트레일링 스탑
+      max_hold_hours: 24     # 최대 보유 시간 (세션 기준 아닌 실시간 경과)

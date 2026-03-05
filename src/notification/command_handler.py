@@ -8,6 +8,8 @@ Supported commands:
     /disable <name>    — Disable a strategy by name
     /set <name> <param> <value>  — Change a strategy parameter
     /k <val>           — Change k_value (0.1–0.9) for all applicable strategies
+    /switchstrategy <name|alias>  — Switch to a strategy exclusively (enables one, disables all others)
+                                    Aliases: tfvb (trend_filtered_breakout), imb (intraday_momentum_breakout)
     /mode <paper|live> — Switch trading mode (paper = virtual, live = real money)
     /pause             — Pause trading (no new orders)
     /resume            — Resume trading
@@ -146,18 +148,19 @@ class TelegramCommandHandler:
         logger.info("Telegram command: %s %s", command, args)
 
         handlers = {
-            "/ping":     self._cmd_ping,
-            "/status":   self._cmd_status,
-            "/strategy": self._cmd_strategy,
-            "/enable":   self._cmd_enable,
-            "/disable":  self._cmd_disable,
-            "/set":      self._cmd_set,
-            "/k":        self._cmd_k,
-            "/mode":     self._cmd_mode,
-            "/pause":    self._cmd_pause,
-            "/resume":   self._cmd_resume,
-            "/stop":     self._cmd_stop,
-            "/help":     self._cmd_help,
+            "/ping":             self._cmd_ping,
+            "/status":           self._cmd_status,
+            "/strategy":         self._cmd_strategy,
+            "/enable":           self._cmd_enable,
+            "/disable":          self._cmd_disable,
+            "/set":              self._cmd_set,
+            "/k":                self._cmd_k,
+            "/switchstrategy":   self._cmd_switchstrategy,
+            "/mode":             self._cmd_mode,
+            "/pause":            self._cmd_pause,
+            "/resume":           self._cmd_resume,
+            "/stop":             self._cmd_stop,
+            "/help":             self._cmd_help,
         }
 
         handler = handlers.get(command)
@@ -378,6 +381,79 @@ class TelegramCommandHandler:
         else:
             await self._notifier.send("⚠️ K값을 사용하는 전략이 없습니다.")
 
+    async def _cmd_switchstrategy(self, args: list[str]) -> None:
+        """Exclusively switch to one strategy — enables it, disables all others.
+
+        Supports short aliases: ``tfvb`` and ``imb``.
+        """
+        # Canonical name mapping (alias → full strategy name)
+        _ALIASES: dict[str, str] = {
+            "tfvb": "trend_filtered_breakout",
+            "imb": "intraday_momentum_breakout",
+            "trend_filtered_breakout": "trend_filtered_breakout",
+            "intraday_momentum_breakout": "intraday_momentum_breakout",
+        }
+
+        if not args:
+            strategy_list = "\n".join(
+                f"  • {s.name} ({'✅' if s.config.enabled else '❌'})"
+                for s in self._strategies
+            )
+            await self._notifier.send(
+                "🔄 <b>[전략 전환]</b>\n"
+                "사용법: /switchstrategy &lt;전략명 또는 단축명&gt;\n\n"
+                "<b>단축명:</b>\n"
+                "  tfvb — trend_filtered_breakout (일봉 전략)\n"
+                "  imb  — intraday_momentum_breakout (1시간봉 전략)\n\n"
+                f"<b>로드된 전략:</b>\n{strategy_list}"
+            )
+            return
+
+        key = args[0].lower()
+        target_name = _ALIASES.get(key)
+
+        if target_name is None:
+            loaded = [s.name for s in self._strategies]
+            await self._notifier.send(
+                f"⚠️ 알 수 없는 전략: <code>{key}</code>\n"
+                f"단축명: <code>tfvb</code>, <code>imb</code>\n"
+                f"전체 명칭: <code>{', '.join(loaded)}</code>"
+            )
+            return
+
+        matched = [s for s in self._strategies if s.name == target_name]
+        if not matched:
+            await self._notifier.send(
+                f"⚠️ 전략이 로드되지 않음: <code>{target_name}</code>\n"
+                f"strategies.yaml에 해당 전략이 설정되어 있는지 확인하세요."
+            )
+            return
+
+        # Enable only the target strategy; disable all others
+        enabled_strategy = matched[0]
+        disabled_names = []
+        for s in self._strategies:
+            if s.name == target_name:
+                s.config.enabled = True
+            else:
+                if s.config.enabled:
+                    disabled_names.append(s.name)
+                s.config.enabled = False
+
+        disabled_text = (
+            "\n비활성화: " + ", ".join(f"<code>{n}</code>" for n in disabled_names)
+            if disabled_names else ""
+        )
+        logger.info(
+            "Strategy switched to '%s' via Telegram (disabled: %s)",
+            target_name, disabled_names,
+        )
+        await self._notifier.send(
+            f"🔄 <b>전략 전환 완료</b>\n"
+            f"활성화: <code>{enabled_strategy.name}</code>"
+            f"{disabled_text}"
+        )
+
     async def _cmd_mode(self, args: list[str]) -> None:
         """Switch between paper (virtual) and live (real money) trading mode."""
         current_mode = self._engine._mode
@@ -447,8 +523,11 @@ class TelegramCommandHandler:
             "/disable &lt;전략명&gt; — 전략 비활성화\n"
             "/set &lt;전략명&gt; &lt;파라미터&gt; &lt;값&gt; — 파라미터 변경\n"
             "  예: /set trend_filtered_breakout k_value 0.35\n"
-            "  예: /set trend_filtered_breakout rsi_min 40\n"
-            "/k &lt;값&gt; — K값 일괄 변경 (범위 0.1~0.9)\n\n"
+            "  예: /set intraday_momentum_breakout rsi_min 52\n"
+            "/k &lt;값&gt; — K값 일괄 변경 (범위 0.1~0.9)\n"
+            "/switchstrategy &lt;tfvb|imb&gt; — 전략 독점 전환\n"
+            "  tfvb: 일봉 전략 (EMA20/60, 일봉)\n"
+            "  imb: 1시간봉 전략 (EMA24/120, 60m)\n\n"
             "<b>🎮 운영 제어</b>\n"
             "/mode &lt;paper|live&gt; — 모드 전환 (모의투자 ↔ 실거래)\n"
             "/pause — 거래 일시정지 (모니터링 계속)\n"

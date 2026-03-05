@@ -352,9 +352,15 @@ class TelegramNotifier:
                     ind = market_indicators.get(market, {})
                     if ind:
                         parts: list[str] = []
+                        # Daily TFVB indicators
                         if "ema_20" in ind and "ema_60" in ind:
                             parts.append(
                                 f"EMA20={ind['ema_20']:,.0f} / EMA60={ind['ema_60']:,.0f}"
+                            )
+                        # 1h IMB indicators
+                        elif "ema_24" in ind and "ema_120" in ind:
+                            parts.append(
+                                f"EMA24={ind['ema_24']:,.0f} / EMA120={ind['ema_120']:,.0f}"
                             )
                         if "rsi" in ind:
                             parts.append(f"RSI={ind['rsi']:.1f}")
