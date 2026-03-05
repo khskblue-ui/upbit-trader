@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html as _html
 import logging
 from typing import TYPE_CHECKING
 
@@ -348,7 +349,7 @@ class TelegramNotifier:
                 for market, reason in market_hold_reasons.items():
                     lines.append("")
                     lines.append(f"<b>{market}</b>")
-                    lines.append(f"  {reason}")
+                    lines.append(f"  {_html.escape(reason)}")
                     ind = market_indicators.get(market, {})
                     if ind:
                         parts: list[str] = []
